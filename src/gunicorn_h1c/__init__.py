@@ -30,6 +30,8 @@ __all__ = [
     "parse_request",
     "parse_response",
     "parse_headers",
+    "parse_to_wsgi_environ",
+    "parse_to_asgi_scope",
     "parse_request_fast",
     "parse_request_raw",
     "HttpRequest",
@@ -43,6 +45,8 @@ try:
         parse_request,
         parse_response,
         parse_headers,
+        parse_to_wsgi_environ,
+        parse_to_asgi_scope,
         ParseError,
         IncompleteError,
     )

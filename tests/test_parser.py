@@ -179,3 +179,173 @@ class TestParseHeaders:
         assert len(headers) == 2
         assert headers[0] == (b"Host", b"localhost")
         assert headers[1] == (b"Content-Type", b"text/plain")
+
+
+class TestParseToWsgiEnviron:
+    """Tests for WSGI environ generation."""
+
+    def test_simple_get(self):
+        from gunicorn_h1c import parse_to_wsgi_environ
+
+        data = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        environ = parse_to_wsgi_environ(data)
+
+        assert environ["REQUEST_METHOD"] == "GET"
+        assert environ["PATH_INFO"] == "/"
+        assert environ["QUERY_STRING"] == ""
+        assert environ["SERVER_PROTOCOL"] == "HTTP/1.1"
+        assert environ["HTTP_HOST"] == "localhost"
+
+    def test_with_query_string(self):
+        from gunicorn_h1c import parse_to_wsgi_environ
+
+        data = b"GET /search?q=hello&page=1 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        environ = parse_to_wsgi_environ(data)
+
+        assert environ["PATH_INFO"] == "/search"
+        assert environ["QUERY_STRING"] == "q=hello&page=1"
+
+    def test_server_and_client(self):
+        from gunicorn_h1c import parse_to_wsgi_environ
+
+        data = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        environ = parse_to_wsgi_environ(
+            data,
+            server=("127.0.0.1", 8000),
+            client=("10.0.0.1", 54321)
+        )
+
+        assert environ["SERVER_NAME"] == "127.0.0.1"
+        assert environ["SERVER_PORT"] == "8000"
+        assert environ["REMOTE_ADDR"] == "10.0.0.1"
+        assert environ["REMOTE_PORT"] == "54321"
+
+    def test_url_scheme(self):
+        from gunicorn_h1c import parse_to_wsgi_environ
+
+        data = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        environ = parse_to_wsgi_environ(data, url_scheme="https")
+
+        assert environ["wsgi.url_scheme"] == "https"
+
+    def test_content_type_header(self):
+        from gunicorn_h1c import parse_to_wsgi_environ
+
+        data = b"POST /api HTTP/1.1\r\nContent-Type: application/json\r\n\r\n"
+        environ = parse_to_wsgi_environ(data)
+
+        assert environ["CONTENT_TYPE"] == "application/json"
+        assert "HTTP_CONTENT_TYPE" not in environ
+
+    def test_content_length_header(self):
+        from gunicorn_h1c import parse_to_wsgi_environ
+
+        data = b"POST /api HTTP/1.1\r\nContent-Length: 42\r\n\r\n"
+        environ = parse_to_wsgi_environ(data)
+
+        assert environ["CONTENT_LENGTH"] == "42"
+        assert "HTTP_CONTENT_LENGTH" not in environ
+
+    def test_header_transformation(self):
+        from gunicorn_h1c import parse_to_wsgi_environ
+
+        data = b"GET / HTTP/1.1\r\nAccept-Language: en-US\r\nX-Custom-Header: value\r\n\r\n"
+        environ = parse_to_wsgi_environ(data)
+
+        assert environ["HTTP_ACCEPT_LANGUAGE"] == "en-US"
+        assert environ["HTTP_X_CUSTOM_HEADER"] == "value"
+
+    def test_duplicate_headers(self):
+        from gunicorn_h1c import parse_to_wsgi_environ
+
+        data = b"GET / HTTP/1.1\r\nAccept: text/html\r\nAccept: application/json\r\n\r\n"
+        environ = parse_to_wsgi_environ(data)
+
+        assert environ["HTTP_ACCEPT"] == "text/html,application/json"
+
+    def test_http_10(self):
+        from gunicorn_h1c import parse_to_wsgi_environ
+
+        data = b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n"
+        environ = parse_to_wsgi_environ(data)
+
+        assert environ["SERVER_PROTOCOL"] == "HTTP/1.0"
+
+
+class TestParseToAsgiScope:
+    """Tests for ASGI scope generation."""
+
+    def test_simple_get(self):
+        from gunicorn_h1c import parse_to_asgi_scope
+
+        data = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        scope = parse_to_asgi_scope(data)
+
+        assert scope["type"] == "http"
+        assert scope["asgi"] == {"version": "3.0", "spec_version": "2.4"}
+        assert scope["http_version"] == "1.1"
+        assert scope["method"] == "GET"
+        assert scope["path"] == "/"
+        assert scope["raw_path"] == b"/"
+        assert scope["query_string"] == b""
+        assert scope["root_path"] == ""
+
+    def test_with_query_string(self):
+        from gunicorn_h1c import parse_to_asgi_scope
+
+        data = b"GET /search?q=hello&page=1 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        scope = parse_to_asgi_scope(data)
+
+        assert scope["path"] == "/search"
+        assert scope["raw_path"] == b"/search"
+        assert scope["query_string"] == b"q=hello&page=1"
+
+    def test_server_and_client(self):
+        from gunicorn_h1c import parse_to_asgi_scope
+
+        data = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        scope = parse_to_asgi_scope(
+            data,
+            server=("127.0.0.1", 8000),
+            client=("10.0.0.1", 54321)
+        )
+
+        assert scope["server"] == ("127.0.0.1", 8000)
+        assert scope["client"] == ("10.0.0.1", 54321)
+
+    def test_scheme_and_root_path(self):
+        from gunicorn_h1c import parse_to_asgi_scope
+
+        data = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        scope = parse_to_asgi_scope(data, scheme="https", root_path="/app")
+
+        assert scope["scheme"] == "https"
+        assert scope["root_path"] == "/app"
+
+    def test_headers_lowercase(self):
+        from gunicorn_h1c import parse_to_asgi_scope
+
+        data = b"GET / HTTP/1.1\r\nHost: localhost\r\nContent-Type: text/plain\r\n\r\n"
+        scope = parse_to_asgi_scope(data)
+
+        headers = scope["headers"]
+        assert len(headers) == 2
+        assert headers[0] == (b"host", b"localhost")
+        assert headers[1] == (b"content-type", b"text/plain")
+
+    def test_http_10(self):
+        from gunicorn_h1c import parse_to_asgi_scope
+
+        data = b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n"
+        scope = parse_to_asgi_scope(data)
+
+        assert scope["http_version"] == "1.0"
+
+    def test_server_none_default(self):
+        from gunicorn_h1c import parse_to_asgi_scope
+
+        data = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        scope = parse_to_asgi_scope(data)
+
+        assert scope["server"] is None
+        assert scope["client"] is None
