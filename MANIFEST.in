@@ -1,0 +1,7 @@
+include LICENSE
+include README.md
+include pyproject.toml
+include setup.py
+
+recursive-include src/gunicorn_h1c *.c *.h
+recursive-include tests *.py

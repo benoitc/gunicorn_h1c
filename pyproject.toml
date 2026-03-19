@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gunicorn_h1c"
+version = "0.1.0"
+description = "Fast HTTP/1.1 parser for Gunicorn using picohttpparser"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Benoit Chesneau", email = "benoitc@gunicorn.org"}
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: C",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+]
+requires-python = ">=3.9"
+
+[project.urls]
+Homepage = "https://github.com/benoitc/gunicorn_h1c"
+Repository = "https://github.com/benoitc/gunicorn_h1c"
+Issues = "https://github.com/benoitc/gunicorn_h1c/issues"
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0",
+    "pytest-benchmark",
+]
+
+[tool.setuptools]
+packages = ["gunicorn_h1c"]
+package-dir = {"" = "src"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
