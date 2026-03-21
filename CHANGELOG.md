@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-03-21
+
+### Changed
+
+- Refactored shared utilities into `pico_utils.h` to reduce code duplication
+- Extracted common header parsing functions used across all three parser modules
+- Improved code maintainability with ~200 lines of duplicate code removed
+
 ## [0.2.0] - 2026-03-21
 
 ### Added
