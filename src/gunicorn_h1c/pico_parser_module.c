@@ -10,7 +10,7 @@
 #include <Python.h>
 #include "picohttpparser.h"
 
-#define MAX_HEADERS 100
+#define MAX_HEADERS 256
 
 /* Forward declarations */
 static PyObject *PicoError;

@@ -142,6 +142,41 @@ class TestFastParser:
 
         assert req.header_count == 3
 
+    def test_incremental_parsing_fast(self):
+        from gunicorn_h1c import parse_request_fast
+        from gunicorn_h1c._parser_fast import IncompleteError
+
+        # Partial request
+        buffer = b"GET / HTTP/1.1\r\n"
+        with pytest.raises(IncompleteError):
+            parse_request_fast(buffer, last_len=0)
+
+        # Complete request with last_len optimization
+        buffer += b"Host: localhost\r\n\r\n"
+        req = parse_request_fast(buffer, last_len=16)
+        assert req.method == b"GET"
+
+    def test_many_headers(self):
+        from gunicorn_h1c import parse_request_fast
+
+        # Build request with 200 headers
+        headers = b"".join(f"X-Header-{i}: value{i}\r\n".encode() for i in range(200))
+        data = b"GET / HTTP/1.1\r\n" + headers + b"\r\n"
+
+        req = parse_request_fast(data)
+        assert req.header_count == 200
+
+    def test_incremental_parsing_raw(self):
+        from gunicorn_h1c._parser_fast import parse_request_raw, IncompleteError
+
+        buffer = b"GET / HTTP/1.1\r\n"
+        with pytest.raises(IncompleteError):
+            parse_request_raw(buffer, last_len=0)
+
+        buffer += b"Host: localhost\r\n\r\n"
+        result = parse_request_raw(buffer, last_len=16)
+        assert result[6] == len(buffer)  # consumed == full length
+
 
 class TestParseResponse:
     """Tests for response parsing."""

@@ -16,7 +16,7 @@
 #include <Python.h>
 #include "picohttpparser.h"
 
-#define MAX_HEADERS 64
+#define MAX_HEADERS 256
 
 /* Exceptions */
 static PyObject *ParseError;
@@ -335,11 +335,14 @@ static PyTypeObject HttpRequestType = {
  * Returns HttpRequest object that references original buffer.
  */
 static PyObject *
-pico_parse_request_fast(PyObject *self, PyObject *args)
+pico_parse_request_fast(PyObject *self, PyObject *args, PyObject *kwargs)
 {
+    static char *kwlist[] = {"data", "last_len", NULL};
     PyObject *data;
+    Py_ssize_t last_len = 0;
 
-    if (!PyArg_ParseTuple(args, "O", &data)) {
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|n", kwlist,
+                                     &data, &last_len)) {
         return NULL;
     }
 
@@ -372,7 +375,7 @@ pico_parse_request_fast(PyObject *self, PyObject *args)
         &req->path, &req->path_len,
         &req->minor_version,
         req->headers, &req->num_headers,
-        0
+        (size_t)last_len
     );
 
     if (ret > 0) {
@@ -402,11 +405,14 @@ pico_parse_request_fast(PyObject *self, PyObject *args)
  * header_data is bytes containing packed header offsets/lengths
  */
 static PyObject *
-pico_parse_request_raw(PyObject *self, PyObject *args)
+pico_parse_request_raw(PyObject *self, PyObject *args, PyObject *kwargs)
 {
+    static char *kwlist[] = {"data", "last_len", NULL};
     Py_buffer buf;
+    Py_ssize_t last_len = 0;
 
-    if (!PyArg_ParseTuple(args, "y*", &buf)) {
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "y*|n", kwlist,
+                                     &buf, &last_len)) {
         return NULL;
     }
 
@@ -422,7 +428,7 @@ pico_parse_request_raw(PyObject *self, PyObject *args)
         &path, &path_len,
         &minor_version,
         headers, &num_headers,
-        0
+        (size_t)last_len
     );
 
     if (ret > 0) {
@@ -477,9 +483,11 @@ pico_parse_request_raw(PyObject *self, PyObject *args)
 
 /* Module methods */
 static PyMethodDef pico_methods[] = {
-    {"parse_request", pico_parse_request_fast, METH_VARARGS,
+    {"parse_request", (PyCFunction)pico_parse_request_fast,
+     METH_VARARGS | METH_KEYWORDS,
      "Parse HTTP request (zero-copy, lazy evaluation)"},
-    {"parse_request_raw", pico_parse_request_raw, METH_VARARGS,
+    {"parse_request_raw", (PyCFunction)pico_parse_request_raw,
+     METH_VARARGS | METH_KEYWORDS,
      "Parse HTTP request (returns raw offsets for maximum speed)"},
     {NULL, NULL, 0, NULL}
 };
