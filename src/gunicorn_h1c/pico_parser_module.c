@@ -9,6 +9,7 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 #include "picohttpparser.h"
+#include "pico_utils.h"
 
 #define MAX_HEADERS 256
 
@@ -75,13 +76,18 @@ pico_parse_request(PyObject *self, PyObject *args, PyObject *kwargs)
         }
 
         for (size_t i = 0; i < num_headers; i++) {
-            PyObject *name = PyBytes_FromStringAndSize(
-                headers[i].name, headers[i].name_len);
-            PyObject *value = PyBytes_FromStringAndSize(
+            PyObject *tuple = pico_create_header_tuple(
+                headers[i].name, headers[i].name_len,
                 headers[i].value, headers[i].value_len);
-            PyObject *tuple = PyTuple_Pack(2, name, value);
-            Py_DECREF(name);
-            Py_DECREF(value);
+            if (!tuple) {
+                Py_DECREF(py_headers);
+                Py_DECREF(result);
+                Py_XDECREF(py_method);
+                Py_XDECREF(py_path);
+                Py_XDECREF(py_version);
+                Py_XDECREF(py_consumed);
+                return NULL;
+            }
             PyList_SET_ITEM(py_headers, i, tuple);
         }
 
@@ -152,14 +158,27 @@ pico_parse_response(PyObject *self, PyObject *args, PyObject *kwargs)
         PyObject *py_consumed = PyLong_FromLong(ret);
 
         PyObject *py_headers = PyList_New(num_headers);
+        if (!py_headers) {
+            Py_DECREF(result);
+            Py_XDECREF(py_status);
+            Py_XDECREF(py_message);
+            Py_XDECREF(py_version);
+            Py_XDECREF(py_consumed);
+            return NULL;
+        }
         for (size_t i = 0; i < num_headers; i++) {
-            PyObject *name = PyBytes_FromStringAndSize(
-                headers[i].name, headers[i].name_len);
-            PyObject *value = PyBytes_FromStringAndSize(
+            PyObject *tuple = pico_create_header_tuple(
+                headers[i].name, headers[i].name_len,
                 headers[i].value, headers[i].value_len);
-            PyObject *tuple = PyTuple_Pack(2, name, value);
-            Py_DECREF(name);
-            Py_DECREF(value);
+            if (!tuple) {
+                Py_DECREF(py_headers);
+                Py_DECREF(result);
+                Py_XDECREF(py_status);
+                Py_XDECREF(py_message);
+                Py_XDECREF(py_version);
+                Py_XDECREF(py_consumed);
+                return NULL;
+            }
             PyList_SET_ITEM(py_headers, i, tuple);
         }
 
@@ -202,37 +221,7 @@ find_query_string(const char *path, size_t path_len)
     return NULL;
 }
 
-/*
- * Helper: Convert header name to WSGI HTTP_* format
- * - Uppercase the name
- * - Replace "-" with "_"
- * - Prepend "HTTP_" (except for CONTENT_TYPE and CONTENT_LENGTH)
- */
-static int
-header_is_content_type(const char *name, size_t name_len)
-{
-    if (name_len != 12) return 0;
-    const char *target = "content-type";
-    for (size_t i = 0; i < 12; i++) {
-        char c = name[i];
-        if (c >= 'A' && c <= 'Z') c += 32;
-        if (c != target[i]) return 0;
-    }
-    return 1;
-}
-
-static int
-header_is_content_length(const char *name, size_t name_len)
-{
-    if (name_len != 14) return 0;
-    const char *target = "content-length";
-    for (size_t i = 0; i < 14; i++) {
-        char c = name[i];
-        if (c >= 'A' && c <= 'Z') c += 32;
-        if (c != target[i]) return 0;
-    }
-    return 1;
-}
+/* header_is_content_type and header_is_content_length moved to pico_utils.h as pico_header_name_eq */
 
 /*
  * parse_to_wsgi_environ(data, server=None, client=None, url_scheme="http") -> dict
@@ -383,8 +372,8 @@ pico_parse_to_wsgi_environ(PyObject *self, PyObject *args, PyObject *kwargs)
         /* Build the environ key name */
         char key_buf[256];
         size_t key_len = 0;
-        int is_content_type = header_is_content_type(name, name_len);
-        int is_content_length = header_is_content_length(name, name_len);
+        int is_content_type = pico_header_name_eq(name, name_len, "content-type", 12);
+        int is_content_length = pico_header_name_eq(name, name_len, "content-length", 14);
 
         if (is_content_type) {
             memcpy(key_buf, "CONTENT_TYPE", 12);
@@ -709,14 +698,15 @@ pico_parse_headers(PyObject *self, PyObject *args, PyObject *kwargs)
 
     if (ret > 0) {
         PyObject *py_headers = PyList_New(num_headers);
+        if (!py_headers) return NULL;
         for (size_t i = 0; i < num_headers; i++) {
-            PyObject *name = PyBytes_FromStringAndSize(
-                headers[i].name, headers[i].name_len);
-            PyObject *value = PyBytes_FromStringAndSize(
+            PyObject *tuple = pico_create_header_tuple(
+                headers[i].name, headers[i].name_len,
                 headers[i].value, headers[i].value_len);
-            PyObject *tuple = PyTuple_Pack(2, name, value);
-            Py_DECREF(name);
-            Py_DECREF(value);
+            if (!tuple) {
+                Py_DECREF(py_headers);
+                return NULL;
+            }
             PyList_SET_ITEM(py_headers, i, tuple);
         }
         return py_headers;

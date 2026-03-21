@@ -15,6 +15,7 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 #include "picohttpparser.h"
+#include "pico_utils.h"
 
 #define MAX_HEADERS 256
 
@@ -107,21 +108,9 @@ HttpRequest_get_headers(HttpRequest *self, void *closure)
         if (!self->py_headers) return NULL;
 
         for (size_t i = 0; i < self->num_headers; i++) {
-            /* Return bytes directly - avoids memoryview->bytes conversion overhead */
-            PyObject *name = PyBytes_FromStringAndSize(
-                self->headers[i].name, self->headers[i].name_len);
-            PyObject *value = PyBytes_FromStringAndSize(
+            PyObject *pair = pico_create_header_tuple(
+                self->headers[i].name, self->headers[i].name_len,
                 self->headers[i].value, self->headers[i].value_len);
-            if (!name || !value) {
-                Py_XDECREF(name);
-                Py_XDECREF(value);
-                Py_DECREF(self->py_headers);
-                self->py_headers = NULL;
-                return NULL;
-            }
-            PyObject *pair = PyTuple_Pack(2, name, value);
-            Py_DECREF(name);
-            Py_DECREF(value);
             if (!pair) {
                 Py_DECREF(self->py_headers);
                 self->py_headers = NULL;
@@ -151,28 +140,7 @@ HttpRequest_get_header(HttpRequest *self, PyObject *args)
         return NULL;
     }
 
-    for (size_t i = 0; i < self->num_headers; i++) {
-        if (self->headers[i].name_len == (size_t)name_len) {
-            /* Case-insensitive compare */
-            int match = 1;
-            for (size_t j = 0; j < (size_t)name_len; j++) {
-                char c1 = self->headers[i].name[j];
-                char c2 = name[j];
-                if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
-                if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
-                if (c1 != c2) {
-                    match = 0;
-                    break;
-                }
-            }
-            if (match) {
-                /* Return bytes directly */
-                return PyBytes_FromStringAndSize(
-                    self->headers[i].value, self->headers[i].value_len);
-            }
-        }
-    }
-    Py_RETURN_NONE;
+    return pico_find_header(self->headers, self->num_headers, name, (size_t)name_len);
 }
 
 /* Get header count without creating list */
@@ -201,100 +169,17 @@ HttpRequest_get_connection_close(HttpRequest *self, void *closure)
     return PyLong_FromLong(self->connection_close);
 }
 
-/* Case-insensitive string comparison helper */
-static int
-header_name_eq(const char *name, size_t name_len, const char *target, size_t target_len)
-{
-    if (name_len != target_len) return 0;
-    for (size_t i = 0; i < name_len; i++) {
-        char c = name[i];
-        if (c >= 'A' && c <= 'Z') c += 32;
-        if (c != target[i]) return 0;
-    }
-    return 1;
-}
+/* header_name_eq moved to pico_utils.h */
 
-/* Extract common headers during parsing - avoids repeated Python scanning */
+/* Extract common headers using shared utility */
 static void
 extract_special_headers(HttpRequest *self)
 {
-    self->content_length = -1;
-    self->has_chunked = 0;
-    self->connection_close = -1;
-
-    for (size_t i = 0; i < self->num_headers; i++) {
-        const char *name = self->headers[i].name;
-        size_t name_len = self->headers[i].name_len;
-        const char *value = self->headers[i].value;
-        size_t value_len = self->headers[i].value_len;
-
-        /* Content-Length */
-        if (header_name_eq(name, name_len, "content-length", 14)) {
-            /* Parse integer value */
-            Py_ssize_t cl = 0;
-            for (size_t j = 0; j < value_len; j++) {
-                char c = value[j];
-                if (c >= '0' && c <= '9') {
-                    cl = cl * 10 + (c - '0');
-                } else {
-                    break;  /* Stop on non-digit */
-                }
-            }
-            self->content_length = cl;
-        }
-        /* Transfer-Encoding */
-        else if (header_name_eq(name, name_len, "transfer-encoding", 17)) {
-            /* Check if "chunked" appears in value (case-insensitive) */
-            for (size_t j = 0; j + 7 <= value_len; j++) {
-                char c0 = value[j];   if (c0 >= 'A' && c0 <= 'Z') c0 += 32;
-                char c1 = value[j+1]; if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
-                char c2 = value[j+2]; if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
-                char c3 = value[j+3]; if (c3 >= 'A' && c3 <= 'Z') c3 += 32;
-                char c4 = value[j+4]; if (c4 >= 'A' && c4 <= 'Z') c4 += 32;
-                char c5 = value[j+5]; if (c5 >= 'A' && c5 <= 'Z') c5 += 32;
-                char c6 = value[j+6]; if (c6 >= 'A' && c6 <= 'Z') c6 += 32;
-                if (c0 == 'c' && c1 == 'h' && c2 == 'u' && c3 == 'n' &&
-                    c4 == 'k' && c5 == 'e' && c6 == 'd') {
-                    self->has_chunked = 1;
-                    break;
-                }
-            }
-        }
-        /* Connection */
-        else if (header_name_eq(name, name_len, "connection", 10)) {
-            /* Check for "close" or "keep-alive" (case-insensitive) */
-            for (size_t j = 0; j + 5 <= value_len; j++) {
-                char c0 = value[j];   if (c0 >= 'A' && c0 <= 'Z') c0 += 32;
-                char c1 = value[j+1]; if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
-                char c2 = value[j+2]; if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
-                char c3 = value[j+3]; if (c3 >= 'A' && c3 <= 'Z') c3 += 32;
-                char c4 = value[j+4]; if (c4 >= 'A' && c4 <= 'Z') c4 += 32;
-                if (c0 == 'c' && c1 == 'l' && c2 == 'o' && c3 == 's' && c4 == 'e') {
-                    self->connection_close = 1;
-                    return;  /* No need to check further */
-                }
-            }
-            /* Check for keep-alive */
-            for (size_t j = 0; j + 10 <= value_len; j++) {
-                char c0 = value[j];   if (c0 >= 'A' && c0 <= 'Z') c0 += 32;
-                char c1 = value[j+1]; if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
-                char c2 = value[j+2]; if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
-                char c3 = value[j+3]; if (c3 >= 'A' && c3 <= 'Z') c3 += 32;
-                char c4 = value[j+4]; /* - */
-                char c5 = value[j+5]; if (c5 >= 'A' && c5 <= 'Z') c5 += 32;
-                char c6 = value[j+6]; if (c6 >= 'A' && c6 <= 'Z') c6 += 32;
-                char c7 = value[j+7]; if (c7 >= 'A' && c7 <= 'Z') c7 += 32;
-                char c8 = value[j+8]; if (c8 >= 'A' && c8 <= 'Z') c8 += 32;
-                char c9 = value[j+9]; if (c9 >= 'A' && c9 <= 'Z') c9 += 32;
-                if (c0 == 'k' && c1 == 'e' && c2 == 'e' && c3 == 'p' &&
-                    c4 == '-' && c5 == 'a' && c6 == 'l' && c7 == 'i' &&
-                    c8 == 'v' && c9 == 'e') {
-                    self->connection_close = 0;
-                    return;  /* No need to check further */
-                }
-            }
-        }
-    }
+    PicoHeaderInfo info;
+    pico_extract_headers(self->headers, self->num_headers, &info);
+    self->content_length = info.content_length;
+    self->has_chunked = info.has_chunked;
+    self->connection_close = info.connection_close;
 }
 
 static PyGetSetDef HttpRequest_getset[] = {

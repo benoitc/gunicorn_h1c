@@ -11,6 +11,7 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 #include "picohttpparser.h"
+#include "pico_utils.h"
 
 #define MAX_HEADERS 256
 #define INITIAL_BUFFER_SIZE 4096
@@ -72,18 +73,7 @@ static int H1CProtocol_feed_headers(H1CProtocol *self);
 static int H1CProtocol_feed_body_content_length(H1CProtocol *self, const char *data, size_t len);
 static int H1CProtocol_feed_body_chunked(H1CProtocol *self);
 
-/* Case-insensitive string comparison */
-static int
-header_name_eq(const char *name, size_t name_len, const char *target, size_t target_len)
-{
-    if (name_len != target_len) return 0;
-    for (size_t i = 0; i < name_len; i++) {
-        char c = name[i];
-        if (c >= 'A' && c <= 'Z') c += 32;
-        if (c != target[i]) return 0;
-    }
-    return 1;
-}
+/* header_name_eq moved to pico_utils.h as pico_header_name_eq */
 
 /* Ensure buffer can hold additional bytes */
 static int
@@ -344,10 +334,13 @@ H1CProtocol_feed_headers(H1CProtocol *self)
     self->py_headers = PyList_New(num_headers);
     if (!self->py_headers) return -1;
 
-    self->content_length = -1;
-    self->is_chunked = 0;
-    self->connection_close = -1;
-    self->should_upgrade = 0;
+    /* Extract special headers using shared utility */
+    PicoHeaderInfo hdr_info;
+    pico_extract_headers(headers, num_headers, &hdr_info);
+    self->content_length = hdr_info.content_length;
+    self->is_chunked = hdr_info.has_chunked;
+    self->connection_close = hdr_info.connection_close;
+    self->should_upgrade = hdr_info.should_upgrade;
 
     for (size_t i = 0; i < num_headers; i++) {
         const char *name = headers[i].name;
@@ -355,18 +348,8 @@ H1CProtocol_feed_headers(H1CProtocol *self)
         const char *value = headers[i].value;
         size_t value_len = headers[i].value_len;
 
-        /* Create header tuple */
-        PyObject *py_name = PyBytes_FromStringAndSize(name, name_len);
-        PyObject *py_value = PyBytes_FromStringAndSize(value, value_len);
-        if (!py_name || !py_value) {
-            Py_XDECREF(py_name);
-            Py_XDECREF(py_value);
-            return -1;
-        }
-
-        PyObject *tuple = PyTuple_Pack(2, py_name, py_value);
-        Py_DECREF(py_name);
-        Py_DECREF(py_value);
+        /* Create header tuple using shared utility */
+        PyObject *tuple = pico_create_header_tuple(name, name_len, value, value_len);
         if (!tuple) return -1;
 
         PyList_SET_ITEM(self->py_headers, i, tuple);
@@ -386,73 +369,6 @@ H1CProtocol_feed_headers(H1CProtocol *self)
             Py_DECREF(value_obj);
             if (!result) return -1;
             Py_DECREF(result);
-        }
-
-        /* Extract special headers */
-        if (header_name_eq(name, name_len, "content-length", 14)) {
-            Py_ssize_t cl = 0;
-            for (size_t j = 0; j < value_len; j++) {
-                char c = value[j];
-                if (c >= '0' && c <= '9') {
-                    cl = cl * 10 + (c - '0');
-                } else {
-                    break;
-                }
-            }
-            self->content_length = cl;
-        }
-        else if (header_name_eq(name, name_len, "transfer-encoding", 17)) {
-            /* Check for "chunked" */
-            for (size_t j = 0; j + 7 <= value_len; j++) {
-                char c0 = value[j];   if (c0 >= 'A' && c0 <= 'Z') c0 += 32;
-                char c1 = value[j+1]; if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
-                char c2 = value[j+2]; if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
-                char c3 = value[j+3]; if (c3 >= 'A' && c3 <= 'Z') c3 += 32;
-                char c4 = value[j+4]; if (c4 >= 'A' && c4 <= 'Z') c4 += 32;
-                char c5 = value[j+5]; if (c5 >= 'A' && c5 <= 'Z') c5 += 32;
-                char c6 = value[j+6]; if (c6 >= 'A' && c6 <= 'Z') c6 += 32;
-                if (c0 == 'c' && c1 == 'h' && c2 == 'u' && c3 == 'n' &&
-                    c4 == 'k' && c5 == 'e' && c6 == 'd') {
-                    self->is_chunked = 1;
-                    break;
-                }
-            }
-        }
-        else if (header_name_eq(name, name_len, "connection", 10)) {
-            for (size_t j = 0; j + 5 <= value_len; j++) {
-                char c0 = value[j];   if (c0 >= 'A' && c0 <= 'Z') c0 += 32;
-                char c1 = value[j+1]; if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
-                char c2 = value[j+2]; if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
-                char c3 = value[j+3]; if (c3 >= 'A' && c3 <= 'Z') c3 += 32;
-                char c4 = value[j+4]; if (c4 >= 'A' && c4 <= 'Z') c4 += 32;
-                if (c0 == 'c' && c1 == 'l' && c2 == 'o' && c3 == 's' && c4 == 'e') {
-                    self->connection_close = 1;
-                    break;
-                }
-            }
-            if (self->connection_close != 1) {
-                for (size_t j = 0; j + 10 <= value_len; j++) {
-                    char c0 = value[j];   if (c0 >= 'A' && c0 <= 'Z') c0 += 32;
-                    char c1 = value[j+1]; if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
-                    char c2 = value[j+2]; if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
-                    char c3 = value[j+3]; if (c3 >= 'A' && c3 <= 'Z') c3 += 32;
-                    char c4 = value[j+4];
-                    char c5 = value[j+5]; if (c5 >= 'A' && c5 <= 'Z') c5 += 32;
-                    char c6 = value[j+6]; if (c6 >= 'A' && c6 <= 'Z') c6 += 32;
-                    char c7 = value[j+7]; if (c7 >= 'A' && c7 <= 'Z') c7 += 32;
-                    char c8 = value[j+8]; if (c8 >= 'A' && c8 <= 'Z') c8 += 32;
-                    char c9 = value[j+9]; if (c9 >= 'A' && c9 <= 'Z') c9 += 32;
-                    if (c0 == 'k' && c1 == 'e' && c2 == 'e' && c3 == 'p' &&
-                        c4 == '-' && c5 == 'a' && c6 == 'l' && c7 == 'i' &&
-                        c8 == 'v' && c9 == 'e') {
-                        self->connection_close = 0;
-                        break;
-                    }
-                }
-            }
-        }
-        else if (header_name_eq(name, name_len, "upgrade", 7)) {
-            self->should_upgrade = 1;
         }
     }
 
