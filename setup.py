@@ -42,6 +42,17 @@ pico_parser_fast = Extension(
     extra_compile_args=extra_compile_args,
 )
 
+# Callback-based protocol parser module
+pico_protocol = Extension(
+    "gunicorn_h1c._protocol",
+    sources=[
+        os.path.join(src_path, "pico_protocol.c"),
+        os.path.join(pico_path, "picohttpparser.c"),
+    ],
+    include_dirs=[pico_path],
+    extra_compile_args=extra_compile_args,
+)
+
 setup(
-    ext_modules=[pico_parser, pico_parser_fast],
+    ext_modules=[pico_parser, pico_parser_fast, pico_protocol],
 )

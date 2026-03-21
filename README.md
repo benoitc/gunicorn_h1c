@@ -6,8 +6,10 @@ Fast HTTP/1.1 parser for Gunicorn using [picohttpparser](https://github.com/h2o/
 
 - SIMD-optimized parsing (SSE4.2 on x86, NEON on ARM)
 - Zero-copy request parsing with lazy Python object creation
+- Callback-based parser for asyncio integration (H1CProtocol)
 - Common header extraction (Content-Length, Transfer-Encoding, Connection)
 - Incremental parsing support
+- Chunked transfer encoding support
 - WSGI environ and ASGI scope generation
 - Python 3.9+
 
@@ -136,6 +138,48 @@ print(scope['client'])       # ('10.0.0.1', 12345)
 print(scope['_consumed'])    # bytes consumed
 ```
 
+### Callback-Based Protocol Parser (asyncio)
+
+For asyncio servers, `H1CProtocol` provides a callback-based API that enables zero-copy,
+synchronous parsing in `data_received()`:
+
+```python
+import asyncio
+from gunicorn_h1c import H1CProtocol
+
+class MyProtocol(asyncio.Protocol):
+    def connection_made(self, transport):
+        self.transport = transport
+        self.parser = H1CProtocol(
+            on_headers_complete=self._on_headers,
+            on_body=self._on_body,
+            on_message_complete=self._on_complete,
+        )
+
+    def data_received(self, data):
+        try:
+            self.parser.feed(data)
+        except ParseError as e:
+            self.transport.close()
+
+    def _on_headers(self):
+        # Build ASGI scope or process headers
+        method = self.parser.method  # b'GET'
+        path = self.parser.path      # b'/path'
+        headers = self.parser.headers  # [(b'Host', b'localhost'), ...]
+
+        # Return True to skip body parsing (e.g., for HEAD requests)
+        return self.parser.method == b"HEAD"
+
+    def _on_body(self, chunk):
+        # Process body chunk (zero-copy)
+        pass
+
+    def _on_complete(self):
+        # Request complete, send response
+        self.parser.reset()  # Reuse for next request (keep-alive)
+```
+
 ### Incremental Parsing
 
 ```python
@@ -178,8 +222,14 @@ Benchmarks on Apple M4 Pro (single thread):
 | Parser | Requests/sec |
 |--------|-------------|
 | gunicorn_h1c (fast) | ~2,500,000 |
+| gunicorn_h1c (H1CProtocol, reused) | ~4,700,000 |
 | httptools | ~2,200,000 |
 | Pure Python | ~150,000 |
+
+**H1CProtocol Performance:**
+- Simple GET: ~4.7M req/s (209ns/op) when reusing parser
+- Incremental parsing: ~3x faster than pull-based API with buffer + retry
+- Body parsing: ~3.0M req/s for chunked, ~3.7M req/s for Content-Length
 
 ## API Reference
 
@@ -219,6 +269,40 @@ Ultra-fast parsing returning raw offsets:
 - `header_count`: int
 - `consumed`: int
 - `header_data`: bytes (packed header offsets)
+
+### Callback-Based Protocol Parser
+
+#### `H1CProtocol`
+
+Callback-based HTTP/1.1 parser for asyncio integration.
+
+**Constructor:**
+```python
+H1CProtocol(
+    on_message_begin=None,      # () -> None
+    on_url=None,                # (url: bytes) -> None
+    on_header=None,             # (name: bytes, value: bytes) -> None
+    on_headers_complete=None,   # () -> bool (return True to skip body)
+    on_body=None,               # (chunk: bytes) -> None
+    on_message_complete=None,   # () -> None
+)
+```
+
+**Methods:**
+- `feed(data: bytes) -> None`: Feed data to parser. Callbacks fire synchronously.
+- `reset() -> None`: Reset parser for next request (keepalive).
+- `get_header(name: bytes) -> bytes | None`: Case-insensitive header lookup.
+
+**Properties (valid after on_headers_complete):**
+- `method`: bytes - HTTP method (GET, POST, etc.)
+- `path`: bytes - Request path including query string
+- `http_version`: tuple[int, int] - HTTP version as (major, minor)
+- `headers`: list[tuple[bytes, bytes]] - List of (name, value) tuples
+- `content_length`: int | None - Content-Length value or None
+- `is_chunked`: bool - True if Transfer-Encoding: chunked
+- `should_keep_alive`: bool - True if connection should be kept alive
+- `should_upgrade`: bool - True if Upgrade header present
+- `is_complete`: bool - True if message parsing is complete
 
 ### Response Parsing
 

@@ -25,16 +25,21 @@ Usage:
     print(req.has_chunked)    # False
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = [
+    # Basic parser
     "parse_request",
     "parse_response",
     "parse_headers",
     "parse_to_wsgi_environ",
     "parse_to_asgi_scope",
+    # Fast parser
     "parse_request_fast",
     "parse_request_raw",
     "HttpRequest",
+    # Callback-based protocol parser
+    "H1CProtocol",
+    # Exceptions
     "ParseError",
     "IncompleteError",
 ]
@@ -66,6 +71,18 @@ try:
 except ImportError as e:
     raise ImportError(
         "Failed to import gunicorn_h1c._parser_fast C extension. "
+        "Please ensure the package is properly installed with: "
+        "pip install gunicorn_h1c"
+    ) from e
+
+try:
+    from gunicorn_h1c._protocol import (
+        H1CProtocol,
+        ParseError as ProtocolParseError,
+    )
+except ImportError as e:
+    raise ImportError(
+        "Failed to import gunicorn_h1c._protocol C extension. "
         "Please ensure the package is properly installed with: "
         "pip install gunicorn_h1c"
     ) from e

@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0] - 2026-03-21
+
+### Added
+
+- `H1CProtocol` - Callback-based HTTP/1.1 parser for asyncio integration
+  - Zero-copy, synchronous parsing in `data_received()` callbacks
+  - Support for Content-Length and chunked transfer encoding body parsing
+  - Callbacks: `on_message_begin`, `on_url`, `on_header`, `on_headers_complete`, `on_body`, `on_message_complete`
+  - Properties: `method`, `path`, `http_version`, `headers`, `content_length`, `is_chunked`, `should_keep_alive`, `should_upgrade`, `is_complete`
+  - `reset()` method for keepalive connection reuse
+  - ~4.7M req/s when reusing parser (7% faster than pull-based API)
+  - ~3x faster than pull-based API for incremental parsing
+
 ## [0.1.0] - 2026-03-21
 
 ### Added
