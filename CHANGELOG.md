@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-03-22
+
+### Fixed
+
+- Non-HTTP protocols (FTP/1.1, RTSP/1.0) now raise `InvalidHTTPVersion` instead of generic `ParseError`
+- Bare CR/LF in header values now detected and raise `InvalidHeader` in error analysis
+- Header size limit calculation now includes ": " separator (name + 2 + value)
+
 ## [0.4.1] - 2026-03-22
 
 ### Improved
