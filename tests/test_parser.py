@@ -601,3 +601,90 @@ class TestDefaultLimits:
         data = b"GET / HTTP/1.1\r\n" + headers + b"\r\n"
         with pytest.raises(LimitRequestHeaders):
             parse_request(data)
+
+
+class TestParseErrorSpecificExceptions:
+    """Tests for specific exceptions when phr_parse_request returns -1."""
+
+    def test_parse_error_lowercase_method(self):
+        """Lowercase method should raise InvalidRequestMethod."""
+        with pytest.raises(InvalidRequestMethod):
+            parse_request(b"get / HTTP/1.1\r\n\r\n")
+
+    def test_parse_error_non_token_char_in_method(self):
+        """Non-token char in method should raise InvalidRequestMethod."""
+        # Using a control character (0x01) inside the method
+        with pytest.raises(InvalidRequestMethod):
+            parse_request(b"GE\x01T / HTTP/1.1\r\n\r\n")
+
+    def test_parse_error_invalid_http_version(self):
+        """HTTP/2.0 should raise InvalidHTTPVersion."""
+        with pytest.raises(InvalidHTTPVersion):
+            parse_request(b"GET / HTTP/2.0\r\n\r\n")
+
+    def test_parse_error_http_09(self):
+        """HTTP/0.9 should raise InvalidHTTPVersion."""
+        with pytest.raises(InvalidHTTPVersion):
+            parse_request(b"GET / HTTP/0.9\r\n\r\n")
+
+    def test_parse_error_space_in_header_name(self):
+        """Space in header name should raise InvalidHeaderName."""
+        with pytest.raises(InvalidHeaderName):
+            parse_request(b"GET / HTTP/1.1\r\nBad Header: value\r\n\r\n")
+
+    def test_parse_error_nul_in_header_value(self):
+        """NUL in header value should raise InvalidHeader."""
+        with pytest.raises(InvalidHeader):
+            parse_request(b"GET / HTTP/1.1\r\nX-Test: val\x00ue\r\n\r\n")
+
+    def test_fast_parser_parse_error_lowercase_method(self):
+        """Fast parser: lowercase method should raise InvalidRequestMethod."""
+        with pytest.raises(InvalidRequestMethod):
+            parse_request_fast(b"get / HTTP/1.1\r\n\r\n")
+
+    def test_fast_parser_parse_error_invalid_http_version(self):
+        """Fast parser: HTTP/2.0 should raise InvalidHTTPVersion."""
+        with pytest.raises(InvalidHTTPVersion):
+            parse_request_fast(b"GET / HTTP/2.0\r\n\r\n")
+
+    def test_fast_parser_parse_error_space_in_header_name(self):
+        """Fast parser: space in header name should raise InvalidHeaderName."""
+        with pytest.raises(InvalidHeaderName):
+            parse_request_fast(b"GET / HTTP/1.1\r\nBad Header: value\r\n\r\n")
+
+    def test_fast_parser_parse_error_nul_in_header_value(self):
+        """Fast parser: NUL in header value should raise InvalidHeader."""
+        with pytest.raises(InvalidHeader):
+            parse_request_fast(b"GET / HTTP/1.1\r\nX-Test: val\x00ue\r\n\r\n")
+
+
+class TestProtocolParseErrorSpecificExceptions:
+    """Tests for specific exceptions in H1CProtocol when phr_parse_request returns -1."""
+
+    def test_protocol_parse_error_lowercase_method(self):
+        """H1CProtocol: lowercase method should raise InvalidRequestMethod."""
+        import gunicorn_h1c
+        protocol = gunicorn_h1c.H1CProtocol(on_headers_complete=lambda: None)
+        with pytest.raises(InvalidRequestMethod):
+            protocol.feed(b"get / HTTP/1.1\r\n\r\n")
+
+    def test_protocol_parse_error_invalid_http_version(self):
+        """H1CProtocol: HTTP/2.0 should raise InvalidHTTPVersion."""
+        import gunicorn_h1c
+        protocol = gunicorn_h1c.H1CProtocol(on_headers_complete=lambda: None)
+        with pytest.raises(InvalidHTTPVersion):
+            protocol.feed(b"GET / HTTP/2.0\r\n\r\n")
+
+    def test_protocol_parse_error_space_in_header_name(self):
+        """H1CProtocol: space in header name should raise InvalidHeaderName."""
+        import gunicorn_h1c
+        protocol = gunicorn_h1c.H1CProtocol(on_headers_complete=lambda: None)
+        with pytest.raises(InvalidHeaderName):
+            protocol.feed(b"GET / HTTP/1.1\r\nBad Header: value\r\n\r\n")
+
+    def test_protocol_parse_error_nul_in_header_value(self):
+        """H1CProtocol: NUL in header value should raise InvalidHeader."""
+        import gunicorn_h1c
+        protocol = gunicorn_h1c.H1CProtocol(on_headers_complete=lambda: None)
+        with pytest.raises(InvalidHeader):
+            protocol.feed(b"GET / HTTP/1.1\r\nX-Test: val\x00ue\r\n\r\n")

@@ -98,8 +98,15 @@ pico_parse_request(PyObject *self, PyObject *args, PyObject *kwargs)
         return NULL;
     }
     else if (ret < 0) {
+        pico_analyze_parse_error(buf.buf, buf.len,
+                                 permit_unconventional_http_method,
+                                 permit_unconventional_http_version,
+                                 PicoError,
+                                 InvalidRequestMethod,
+                                 InvalidHTTPVersion,
+                                 InvalidHeaderName,
+                                 InvalidHeader);
         PyBuffer_Release(&buf);
-        PyErr_SetString(PicoError, "Invalid HTTP request");
         return NULL;
     }
 
@@ -368,8 +375,15 @@ pico_parse_to_wsgi_environ(PyObject *self, PyObject *args, PyObject *kwargs)
         return NULL;
     }
     else if (ret < 0) {
+        pico_analyze_parse_error(buf.buf, buf.len,
+                                 permit_unconventional_http_method,
+                                 permit_unconventional_http_version,
+                                 PicoError,
+                                 InvalidRequestMethod,
+                                 InvalidHTTPVersion,
+                                 InvalidHeaderName,
+                                 InvalidHeader);
         PyBuffer_Release(&buf);
-        PyErr_SetString(PicoError, "Invalid HTTP request");
         return NULL;
     }
 
@@ -655,8 +669,15 @@ pico_parse_to_asgi_scope(PyObject *self, PyObject *args, PyObject *kwargs)
         return NULL;
     }
     else if (ret < 0) {
+        pico_analyze_parse_error(buf.buf, buf.len,
+                                 permit_unconventional_http_method,
+                                 permit_unconventional_http_version,
+                                 PicoError,
+                                 InvalidRequestMethod,
+                                 InvalidHTTPVersion,
+                                 InvalidHeaderName,
+                                 InvalidHeader);
         PyBuffer_Release(&buf);
-        PyErr_SetString(PicoError, "Invalid HTTP request");
         return NULL;
     }
 

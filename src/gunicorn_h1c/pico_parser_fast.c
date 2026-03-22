@@ -302,8 +302,15 @@ pico_parse_request_fast(PyObject *self, PyObject *args, PyObject *kwargs)
         return NULL;
     }
     else if (ret < 0) {
+        pico_analyze_parse_error(req->view.buf, req->view.len,
+                                 permit_unconventional_http_method,
+                                 permit_unconventional_http_version,
+                                 ParseError,
+                                 InvalidRequestMethod,
+                                 InvalidHTTPVersion,
+                                 InvalidHeaderName,
+                                 InvalidHeader);
         Py_DECREF(req);
-        PyErr_SetString(ParseError, "Invalid HTTP request");
         return NULL;
     }
 

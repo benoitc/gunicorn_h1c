@@ -406,6 +406,148 @@ pico_find_request_line_length(const char *buf, size_t buf_len)
 }
 
 /*
+ * Analyze buffer when phr_parse_request returns -1 and set specific exception.
+ * Returns -1 (always sets an exception).
+ *
+ * Analysis order:
+ * 1. Find method and validate characters
+ * 2. Find HTTP version and validate
+ * 3. Scan headers for invalid characters
+ * 4. Fallback to generic ParseError
+ */
+static inline int
+pico_analyze_parse_error(const char *buf, size_t buf_len,
+                         int permit_unconventional_method,
+                         int permit_unconventional_version,
+                         PyObject *ParseError,
+                         PyObject *InvalidRequestMethod,
+                         PyObject *InvalidHTTPVersion,
+                         PyObject *InvalidHeaderName,
+                         PyObject *InvalidHeader)
+{
+    /* 1. Find and validate method (before first space) */
+    size_t method_end = 0;
+    for (size_t i = 0; i < buf_len; i++) {
+        if (buf[i] == ' ') {
+            method_end = i;
+            break;
+        }
+    }
+
+    if (method_end > 0) {
+        /* Check method for invalid chars */
+        for (size_t i = 0; i < method_end; i++) {
+            unsigned char c = (unsigned char)buf[i];
+            if (!pico_is_token_char(c)) {
+                PyErr_Format(InvalidRequestMethod,
+                    "Invalid character '\\x%02x' in HTTP method", c);
+                return -1;
+            }
+            if (!permit_unconventional_method && c >= 'a' && c <= 'z') {
+                PyErr_SetString(InvalidRequestMethod,
+                    "Lowercase letters not allowed in HTTP method");
+                return -1;
+            }
+        }
+    }
+
+    /* 2. Find and validate HTTP version (after path, look for "HTTP/") */
+    const char *http_marker = NULL;
+    for (size_t i = 0; i + 5 <= buf_len; i++) {
+        if (buf[i] == 'H' && buf[i+1] == 'T' && buf[i+2] == 'T' &&
+            buf[i+3] == 'P' && buf[i+4] == '/') {
+            http_marker = &buf[i];
+            break;
+        }
+    }
+
+    if (http_marker && !permit_unconventional_version) {
+        /* Check if it's HTTP/1.0 or HTTP/1.1 */
+        size_t remaining = buf_len - (http_marker - buf);
+        if (remaining >= 8) {
+            /* HTTP/X.Y followed by \r or end */
+            char major = http_marker[5];
+            char dot = http_marker[6];
+            char minor = http_marker[7];
+            if (major != '1' || dot != '.' || (minor != '0' && minor != '1')) {
+                PyErr_SetString(InvalidHTTPVersion,
+                    "Invalid HTTP version (only HTTP/1.0 and HTTP/1.1 allowed)");
+                return -1;
+            }
+        }
+    }
+
+    /* 3. Find and scan headers (after first \r\n) */
+    const char *headers_start = NULL;
+    for (size_t i = 0; i + 1 < buf_len; i++) {
+        if (buf[i] == '\r' && buf[i+1] == '\n') {
+            headers_start = &buf[i + 2];
+            break;
+        }
+    }
+
+    if (headers_start) {
+        size_t headers_len = buf_len - (headers_start - buf);
+        const char *p = headers_start;
+        const char *end = headers_start + headers_len;
+
+        while (p < end) {
+            /* Find colon (end of header name) */
+            const char *colon = NULL;
+            const char *line_end = NULL;
+
+            for (const char *q = p; q < end; q++) {
+                if (*q == ':' && !colon) colon = q;
+                if (q + 1 < end && *q == '\r' && *(q+1) == '\n') {
+                    line_end = q;
+                    break;
+                }
+            }
+
+            if (!line_end) break;  /* Incomplete */
+
+            /* Empty line = end of headers */
+            if (p == line_end) break;
+
+            /* Validate header name */
+            if (colon && colon > p) {
+                for (const char *q = p; q < colon; q++) {
+                    unsigned char c = (unsigned char)*q;
+                    if (!pico_is_token_char(c)) {
+                        PyErr_Format(InvalidHeaderName,
+                            "Invalid character '\\x%02x' in header name", c);
+                        return -1;
+                    }
+                }
+            }
+
+            /* Validate header value (look for NUL) */
+            if (colon && colon + 1 < line_end) {
+                const char *value_start = colon + 1;
+                /* Skip leading whitespace */
+                while (value_start < line_end &&
+                       (*value_start == ' ' || *value_start == '\t')) {
+                    value_start++;
+                }
+                for (const char *q = value_start; q < line_end; q++) {
+                    if (*q == '\0') {
+                        PyErr_SetString(InvalidHeader,
+                            "NUL character not allowed in header value");
+                        return -1;
+                    }
+                }
+            }
+
+            p = line_end + 2;  /* Skip \r\n */
+        }
+    }
+
+    /* Fallback to generic error */
+    PyErr_SetString(ParseError, "Invalid HTTP request");
+    return -1;
+}
+
+/*
  * Validate all headers against limits and character rules.
  * Returns 0 on success, -1 on error (sets Python exception).
  */

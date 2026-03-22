@@ -348,7 +348,14 @@ H1CProtocol_feed_headers(H1CProtocol *self)
     }
 
     if (ret == -1) {
-        PyErr_SetString(ParseError, "Invalid HTTP request");
+        pico_analyze_parse_error(self->buffer, self->buffer_len,
+                                 self->permit_unconventional_http_method,
+                                 self->permit_unconventional_http_version,
+                                 ParseError,
+                                 InvalidRequestMethod,
+                                 InvalidHTTPVersion,
+                                 InvalidHeaderName,
+                                 InvalidHeader);
         return -1;
     }
 
