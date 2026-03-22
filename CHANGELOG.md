@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.1] - 2026-03-22
+
+### Improved
+
+- Specific exception analysis when `phr_parse_request()` returns -1
+  - Now analyzes the buffer to identify the exact cause of parse failure
+  - Raises `InvalidRequestMethod` for invalid/lowercase method characters
+  - Raises `InvalidHTTPVersion` for unsupported HTTP versions (e.g., HTTP/2.0, HTTP/0.9)
+  - Raises `InvalidHeaderName` for invalid header name characters (e.g., space)
+  - Raises `InvalidHeader` for NUL characters in header values
+  - Falls back to generic `ParseError` only when specific cause cannot be determined
+
 ## [0.4.0] - 2026-03-22
 
 ### Added
