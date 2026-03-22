@@ -13,25 +13,65 @@
 
 #define MAX_HEADERS 256
 
-/* Forward declarations */
+/* Forward declarations - Exception types */
 static PyObject *PicoError;
 static PyObject *IncompleteError;
 
+/* Specific validation exception types */
+static PyObject *LimitRequestLine;
+static PyObject *LimitRequestHeaders;
+static PyObject *InvalidRequestMethod;
+static PyObject *InvalidHTTPVersion;
+static PyObject *InvalidHeaderName;
+static PyObject *InvalidHeader;
+
 /*
- * parse_request(data: bytes, last_len: int = 0) -> dict
+ * parse_request(data: bytes, last_len: int = 0, ...) -> dict
  *
  * Parse HTTP request and return dict with:
  *   method, path, minor_version, headers, consumed
+ *
+ * Additional parameters for limit enforcement:
+ *   limit_request_line: max request line length (default 8190)
+ *   limit_request_fields: max number of headers (default 100)
+ *   limit_request_field_size: max header size (default 8190)
+ *   permit_unconventional_http_method: allow lowercase methods etc (default False)
+ *   permit_unconventional_http_version: allow non-1.0/1.1 versions (default False)
  */
 static PyObject *
 pico_parse_request(PyObject *self, PyObject *args, PyObject *kwargs)
 {
-    static char *kwlist[] = {"data", "last_len", NULL};
+    static char *kwlist[] = {
+        "data", "last_len",
+        "limit_request_line", "limit_request_fields", "limit_request_field_size",
+        "permit_unconventional_http_method", "permit_unconventional_http_version",
+        NULL
+    };
     Py_buffer buf;
     Py_ssize_t last_len = 0;
+    Py_ssize_t limit_request_line = PICO_DEFAULT_LIMIT_REQUEST_LINE;
+    Py_ssize_t limit_request_fields = PICO_DEFAULT_LIMIT_REQUEST_FIELDS;
+    Py_ssize_t limit_request_field_size = PICO_DEFAULT_LIMIT_REQUEST_FIELD_SIZE;
+    int permit_unconventional_http_method = 0;
+    int permit_unconventional_http_version = 0;
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "y*|n", kwlist,
-                                     &buf, &last_len)) {
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "y*|nnnnpp", kwlist,
+                                     &buf, &last_len,
+                                     &limit_request_line,
+                                     &limit_request_fields,
+                                     &limit_request_field_size,
+                                     &permit_unconventional_http_method,
+                                     &permit_unconventional_http_version)) {
+        return NULL;
+    }
+
+    /* Check request line length before parsing */
+    Py_ssize_t req_line_len = pico_find_request_line_length(buf.buf, buf.len);
+    if (req_line_len >= 0 && req_line_len > limit_request_line) {
+        PyBuffer_Release(&buf);
+        PyErr_Format(LimitRequestLine,
+            "Request line length (%zd) exceeds limit (%zd)",
+            req_line_len, limit_request_line);
         return NULL;
     }
 
@@ -52,21 +92,80 @@ pico_parse_request(PyObject *self, PyObject *args, PyObject *kwargs)
         (size_t)last_len
     );
 
+    if (ret == -2) {
+        PyBuffer_Release(&buf);
+        PyErr_SetString(IncompleteError, "Incomplete request, need more data");
+        return NULL;
+    }
+    else if (ret < 0) {
+        PyBuffer_Release(&buf);
+        PyErr_SetString(PicoError, "Invalid HTTP request");
+        return NULL;
+    }
+
+    /* Parse successful - now validate */
+
+    /* Validate method */
+    if (pico_validate_method(method, method_len,
+                              permit_unconventional_http_method,
+                              InvalidRequestMethod) < 0) {
+        PyBuffer_Release(&buf);
+        return NULL;
+    }
+
+    /* Validate HTTP version */
+    if (pico_validate_version(minor_version,
+                               permit_unconventional_http_version,
+                               InvalidHTTPVersion) < 0) {
+        PyBuffer_Release(&buf);
+        return NULL;
+    }
+
+    /* Validate headers */
+    PicoValidationConfig config = {
+        .limit_request_line = limit_request_line,
+        .limit_request_fields = limit_request_fields,
+        .limit_request_field_size = limit_request_field_size,
+        .permit_unconventional_http_method = permit_unconventional_http_method,
+        .permit_unconventional_http_version = permit_unconventional_http_version
+    };
+
+    if (pico_validate_headers(headers, num_headers, &config,
+                               LimitRequestHeaders,
+                               InvalidHeaderName,
+                               InvalidHeader) < 0) {
+        PyBuffer_Release(&buf);
+        return NULL;
+    }
+
     PyBuffer_Release(&buf);
 
-    if (ret > 0) {
-        /* Success - build result dict */
-        PyObject *result = PyDict_New();
-        if (!result) return NULL;
+    /* Success - build result dict */
+    PyObject *result = PyDict_New();
+    if (!result) return NULL;
 
-        PyObject *py_method = PyBytes_FromStringAndSize(method, method_len);
-        PyObject *py_path = PyBytes_FromStringAndSize(path, path_len);
-        PyObject *py_version = PyLong_FromLong(minor_version);
-        PyObject *py_consumed = PyLong_FromLong(ret);
+    PyObject *py_method = PyBytes_FromStringAndSize(method, method_len);
+    PyObject *py_path = PyBytes_FromStringAndSize(path, path_len);
+    PyObject *py_version = PyLong_FromLong(minor_version);
+    PyObject *py_consumed = PyLong_FromLong(ret);
 
-        /* Build headers list */
-        PyObject *py_headers = PyList_New(num_headers);
-        if (!py_headers) {
+    /* Build headers list */
+    PyObject *py_headers = PyList_New(num_headers);
+    if (!py_headers) {
+        Py_DECREF(result);
+        Py_XDECREF(py_method);
+        Py_XDECREF(py_path);
+        Py_XDECREF(py_version);
+        Py_XDECREF(py_consumed);
+        return NULL;
+    }
+
+    for (size_t i = 0; i < num_headers; i++) {
+        PyObject *tuple = pico_create_header_tuple(
+            headers[i].name, headers[i].name_len,
+            headers[i].value, headers[i].value_len);
+        if (!tuple) {
+            Py_DECREF(py_headers);
             Py_DECREF(result);
             Py_XDECREF(py_method);
             Py_XDECREF(py_path);
@@ -74,45 +173,22 @@ pico_parse_request(PyObject *self, PyObject *args, PyObject *kwargs)
             Py_XDECREF(py_consumed);
             return NULL;
         }
-
-        for (size_t i = 0; i < num_headers; i++) {
-            PyObject *tuple = pico_create_header_tuple(
-                headers[i].name, headers[i].name_len,
-                headers[i].value, headers[i].value_len);
-            if (!tuple) {
-                Py_DECREF(py_headers);
-                Py_DECREF(result);
-                Py_XDECREF(py_method);
-                Py_XDECREF(py_path);
-                Py_XDECREF(py_version);
-                Py_XDECREF(py_consumed);
-                return NULL;
-            }
-            PyList_SET_ITEM(py_headers, i, tuple);
-        }
-
-        PyDict_SetItemString(result, "method", py_method);
-        PyDict_SetItemString(result, "path", py_path);
-        PyDict_SetItemString(result, "minor_version", py_version);
-        PyDict_SetItemString(result, "headers", py_headers);
-        PyDict_SetItemString(result, "consumed", py_consumed);
-
-        Py_DECREF(py_method);
-        Py_DECREF(py_path);
-        Py_DECREF(py_version);
-        Py_DECREF(py_headers);
-        Py_DECREF(py_consumed);
-
-        return result;
+        PyList_SET_ITEM(py_headers, i, tuple);
     }
-    else if (ret == -2) {
-        PyErr_SetString(IncompleteError, "Incomplete request, need more data");
-        return NULL;
-    }
-    else {
-        PyErr_SetString(PicoError, "Invalid HTTP request");
-        return NULL;
-    }
+
+    PyDict_SetItemString(result, "method", py_method);
+    PyDict_SetItemString(result, "path", py_path);
+    PyDict_SetItemString(result, "minor_version", py_version);
+    PyDict_SetItemString(result, "headers", py_headers);
+    PyDict_SetItemString(result, "consumed", py_consumed);
+
+    Py_DECREF(py_method);
+    Py_DECREF(py_path);
+    Py_DECREF(py_version);
+    Py_DECREF(py_headers);
+    Py_DECREF(py_consumed);
+
+    return result;
 }
 
 /*
@@ -224,23 +300,48 @@ find_query_string(const char *path, size_t path_len)
 /* header_is_content_type and header_is_content_length moved to pico_utils.h as pico_header_name_eq */
 
 /*
- * parse_to_wsgi_environ(data, server=None, client=None, url_scheme="http") -> dict
+ * parse_to_wsgi_environ(data, server=None, client=None, url_scheme="http", ...) -> dict
  *
  * Parse HTTP request and return WSGI environ dict.
  */
 static PyObject *
 pico_parse_to_wsgi_environ(PyObject *self, PyObject *args, PyObject *kwargs)
 {
-    static char *kwlist[] = {"data", "server", "client", "url_scheme", NULL};
+    static char *kwlist[] = {
+        "data", "server", "client", "url_scheme",
+        "limit_request_line", "limit_request_fields", "limit_request_field_size",
+        "permit_unconventional_http_method", "permit_unconventional_http_version",
+        NULL
+    };
     Py_buffer buf;
     PyObject *server = NULL;
     PyObject *client = NULL;
     const char *url_scheme = "http";
     Py_ssize_t url_scheme_len = 4;
+    Py_ssize_t limit_request_line = PICO_DEFAULT_LIMIT_REQUEST_LINE;
+    Py_ssize_t limit_request_fields = PICO_DEFAULT_LIMIT_REQUEST_FIELDS;
+    Py_ssize_t limit_request_field_size = PICO_DEFAULT_LIMIT_REQUEST_FIELD_SIZE;
+    int permit_unconventional_http_method = 0;
+    int permit_unconventional_http_version = 0;
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "y*|OOs#", kwlist,
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "y*|OOs#nnnpp", kwlist,
                                      &buf, &server, &client,
-                                     &url_scheme, &url_scheme_len)) {
+                                     &url_scheme, &url_scheme_len,
+                                     &limit_request_line,
+                                     &limit_request_fields,
+                                     &limit_request_field_size,
+                                     &permit_unconventional_http_method,
+                                     &permit_unconventional_http_version)) {
+        return NULL;
+    }
+
+    /* Check request line length before parsing */
+    Py_ssize_t req_line_len = pico_find_request_line_length(buf.buf, buf.len);
+    if (req_line_len >= 0 && req_line_len > limit_request_line) {
+        PyBuffer_Release(&buf);
+        PyErr_Format(LimitRequestLine,
+            "Request line length (%zd) exceeds limit (%zd)",
+            req_line_len, limit_request_line);
         return NULL;
     }
 
@@ -261,16 +362,51 @@ pico_parse_to_wsgi_environ(PyObject *self, PyObject *args, PyObject *kwargs)
         0
     );
 
-    PyBuffer_Release(&buf);
-
     if (ret == -2) {
+        PyBuffer_Release(&buf);
         PyErr_SetString(IncompleteError, "Incomplete request, need more data");
         return NULL;
     }
     else if (ret < 0) {
+        PyBuffer_Release(&buf);
         PyErr_SetString(PicoError, "Invalid HTTP request");
         return NULL;
     }
+
+    /* Validate method */
+    if (pico_validate_method(method, method_len,
+                              permit_unconventional_http_method,
+                              InvalidRequestMethod) < 0) {
+        PyBuffer_Release(&buf);
+        return NULL;
+    }
+
+    /* Validate HTTP version */
+    if (pico_validate_version(minor_version,
+                               permit_unconventional_http_version,
+                               InvalidHTTPVersion) < 0) {
+        PyBuffer_Release(&buf);
+        return NULL;
+    }
+
+    /* Validate headers */
+    PicoValidationConfig config = {
+        .limit_request_line = limit_request_line,
+        .limit_request_fields = limit_request_fields,
+        .limit_request_field_size = limit_request_field_size,
+        .permit_unconventional_http_method = permit_unconventional_http_method,
+        .permit_unconventional_http_version = permit_unconventional_http_version
+    };
+
+    if (pico_validate_headers(headers, num_headers, &config,
+                               LimitRequestHeaders,
+                               InvalidHeaderName,
+                               InvalidHeader) < 0) {
+        PyBuffer_Release(&buf);
+        return NULL;
+    }
+
+    PyBuffer_Release(&buf);
 
     /* Success - build WSGI environ dict */
     PyObject *environ = PyDict_New();
@@ -448,14 +584,19 @@ error:
 }
 
 /*
- * parse_to_asgi_scope(data, server=None, client=None, scheme="http", root_path="") -> dict
+ * parse_to_asgi_scope(data, server=None, client=None, scheme="http", root_path="", ...) -> dict
  *
  * Parse HTTP request and return ASGI scope dict.
  */
 static PyObject *
 pico_parse_to_asgi_scope(PyObject *self, PyObject *args, PyObject *kwargs)
 {
-    static char *kwlist[] = {"data", "server", "client", "scheme", "root_path", NULL};
+    static char *kwlist[] = {
+        "data", "server", "client", "scheme", "root_path",
+        "limit_request_line", "limit_request_fields", "limit_request_field_size",
+        "permit_unconventional_http_method", "permit_unconventional_http_version",
+        NULL
+    };
     Py_buffer buf;
     PyObject *server = NULL;
     PyObject *client = NULL;
@@ -463,11 +604,31 @@ pico_parse_to_asgi_scope(PyObject *self, PyObject *args, PyObject *kwargs)
     Py_ssize_t scheme_len = 4;
     const char *root_path = "";
     Py_ssize_t root_path_len = 0;
+    Py_ssize_t limit_request_line = PICO_DEFAULT_LIMIT_REQUEST_LINE;
+    Py_ssize_t limit_request_fields = PICO_DEFAULT_LIMIT_REQUEST_FIELDS;
+    Py_ssize_t limit_request_field_size = PICO_DEFAULT_LIMIT_REQUEST_FIELD_SIZE;
+    int permit_unconventional_http_method = 0;
+    int permit_unconventional_http_version = 0;
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "y*|OOs#s#", kwlist,
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "y*|OOs#s#nnnpp", kwlist,
                                      &buf, &server, &client,
                                      &scheme, &scheme_len,
-                                     &root_path, &root_path_len)) {
+                                     &root_path, &root_path_len,
+                                     &limit_request_line,
+                                     &limit_request_fields,
+                                     &limit_request_field_size,
+                                     &permit_unconventional_http_method,
+                                     &permit_unconventional_http_version)) {
+        return NULL;
+    }
+
+    /* Check request line length before parsing */
+    Py_ssize_t req_line_len = pico_find_request_line_length(buf.buf, buf.len);
+    if (req_line_len >= 0 && req_line_len > limit_request_line) {
+        PyBuffer_Release(&buf);
+        PyErr_Format(LimitRequestLine,
+            "Request line length (%zd) exceeds limit (%zd)",
+            req_line_len, limit_request_line);
         return NULL;
     }
 
@@ -488,16 +649,51 @@ pico_parse_to_asgi_scope(PyObject *self, PyObject *args, PyObject *kwargs)
         0
     );
 
-    PyBuffer_Release(&buf);
-
     if (ret == -2) {
+        PyBuffer_Release(&buf);
         PyErr_SetString(IncompleteError, "Incomplete request, need more data");
         return NULL;
     }
     else if (ret < 0) {
+        PyBuffer_Release(&buf);
         PyErr_SetString(PicoError, "Invalid HTTP request");
         return NULL;
     }
+
+    /* Validate method */
+    if (pico_validate_method(method, method_len,
+                              permit_unconventional_http_method,
+                              InvalidRequestMethod) < 0) {
+        PyBuffer_Release(&buf);
+        return NULL;
+    }
+
+    /* Validate HTTP version */
+    if (pico_validate_version(minor_version,
+                               permit_unconventional_http_version,
+                               InvalidHTTPVersion) < 0) {
+        PyBuffer_Release(&buf);
+        return NULL;
+    }
+
+    /* Validate headers */
+    PicoValidationConfig config = {
+        .limit_request_line = limit_request_line,
+        .limit_request_fields = limit_request_fields,
+        .limit_request_field_size = limit_request_field_size,
+        .permit_unconventional_http_method = permit_unconventional_http_method,
+        .permit_unconventional_http_version = permit_unconventional_http_version
+    };
+
+    if (pico_validate_headers(headers, num_headers, &config,
+                               LimitRequestHeaders,
+                               InvalidHeaderName,
+                               InvalidHeader) < 0) {
+        PyBuffer_Release(&buf);
+        return NULL;
+    }
+
+    PyBuffer_Release(&buf);
 
     /* Success - build ASGI scope dict */
     PyObject *scope = PyDict_New();
@@ -728,9 +924,21 @@ static PyMethodDef pico_methods[] = {
      "Parse HTTP request.\n\n"
      "Args:\n"
      "    data: Raw HTTP request bytes\n"
-     "    last_len: Previously parsed length for incremental parsing\n\n"
+     "    last_len: Previously parsed length for incremental parsing\n"
+     "    limit_request_line: Max request line length (default 8190)\n"
+     "    limit_request_fields: Max number of headers (default 100)\n"
+     "    limit_request_field_size: Max header size (default 8190)\n"
+     "    permit_unconventional_http_method: Allow lowercase methods (default False)\n"
+     "    permit_unconventional_http_version: Allow non-1.0/1.1 (default False)\n\n"
      "Returns:\n"
-     "    dict with method, path, minor_version, headers, consumed"},
+     "    dict with method, path, minor_version, headers, consumed\n\n"
+     "Raises:\n"
+     "    LimitRequestLine: Request line exceeds limit\n"
+     "    LimitRequestHeaders: Too many headers or header too large\n"
+     "    InvalidRequestMethod: Bad method characters\n"
+     "    InvalidHTTPVersion: Not HTTP/1.0 or HTTP/1.1\n"
+     "    InvalidHeaderName: Bad header name characters\n"
+     "    InvalidHeader: Bad header value (NUL, CR, LF)"},
 
     {"parse_response", (PyCFunction)pico_parse_response,
      METH_VARARGS | METH_KEYWORDS,
@@ -794,14 +1002,47 @@ PyInit__parser(void)
     PyObject *m = PyModule_Create(&pico_module);
     if (m == NULL) return NULL;
 
-    /* Create exception types */
+    /* Create base exception types */
     PicoError = PyErr_NewException("gunicorn_h1c._parser.ParseError", PyExc_ValueError, NULL);
+    if (!PicoError) return NULL;
     Py_INCREF(PicoError);
     PyModule_AddObject(m, "ParseError", PicoError);
 
     IncompleteError = PyErr_NewException("gunicorn_h1c._parser.IncompleteError", PyExc_Exception, NULL);
+    if (!IncompleteError) return NULL;
     Py_INCREF(IncompleteError);
     PyModule_AddObject(m, "IncompleteError", IncompleteError);
+
+    /* Create specific validation exception types (inherit from ParseError) */
+    LimitRequestLine = PyErr_NewException("gunicorn_h1c._parser.LimitRequestLine", PicoError, NULL);
+    if (!LimitRequestLine) return NULL;
+    Py_INCREF(LimitRequestLine);
+    PyModule_AddObject(m, "LimitRequestLine", LimitRequestLine);
+
+    LimitRequestHeaders = PyErr_NewException("gunicorn_h1c._parser.LimitRequestHeaders", PicoError, NULL);
+    if (!LimitRequestHeaders) return NULL;
+    Py_INCREF(LimitRequestHeaders);
+    PyModule_AddObject(m, "LimitRequestHeaders", LimitRequestHeaders);
+
+    InvalidRequestMethod = PyErr_NewException("gunicorn_h1c._parser.InvalidRequestMethod", PicoError, NULL);
+    if (!InvalidRequestMethod) return NULL;
+    Py_INCREF(InvalidRequestMethod);
+    PyModule_AddObject(m, "InvalidRequestMethod", InvalidRequestMethod);
+
+    InvalidHTTPVersion = PyErr_NewException("gunicorn_h1c._parser.InvalidHTTPVersion", PicoError, NULL);
+    if (!InvalidHTTPVersion) return NULL;
+    Py_INCREF(InvalidHTTPVersion);
+    PyModule_AddObject(m, "InvalidHTTPVersion", InvalidHTTPVersion);
+
+    InvalidHeaderName = PyErr_NewException("gunicorn_h1c._parser.InvalidHeaderName", PicoError, NULL);
+    if (!InvalidHeaderName) return NULL;
+    Py_INCREF(InvalidHeaderName);
+    PyModule_AddObject(m, "InvalidHeaderName", InvalidHeaderName);
+
+    InvalidHeader = PyErr_NewException("gunicorn_h1c._parser.InvalidHeader", PicoError, NULL);
+    if (!InvalidHeader) return NULL;
+    Py_INCREF(InvalidHeader);
+    PyModule_AddObject(m, "InvalidHeader", InvalidHeader);
 
     return m;
 }

@@ -1,6 +1,18 @@
 """Tests for gunicorn_h1c HTTP parser."""
 import pytest
 
+from gunicorn_h1c import (
+    parse_request,
+    parse_request_fast,
+    ParseError,
+    LimitRequestLine,
+    LimitRequestHeaders,
+    InvalidRequestMethod,
+    InvalidHTTPVersion,
+    InvalidHeaderName,
+    InvalidHeader,
+)
+
 
 class TestBasicParser:
     """Tests for the basic parser (_parser module)."""
@@ -159,11 +171,11 @@ class TestFastParser:
     def test_many_headers(self):
         from gunicorn_h1c import parse_request_fast
 
-        # Build request with 200 headers
+        # Build request with 200 headers (must increase limit from default 100)
         headers = b"".join(f"X-Header-{i}: value{i}\r\n".encode() for i in range(200))
         data = b"GET / HTTP/1.1\r\n" + headers + b"\r\n"
 
-        req = parse_request_fast(data)
+        req = parse_request_fast(data, limit_request_fields=256)
         assert req.header_count == 200
 
     def test_incremental_parsing_raw(self):
@@ -384,3 +396,208 @@ class TestParseToAsgiScope:
 
         assert scope["server"] is None
         assert scope["client"] is None
+
+
+class TestValidationExceptions:
+    """Tests for validation exception hierarchy."""
+
+    def test_exception_hierarchy(self):
+        """All validation exceptions should inherit from ParseError."""
+        assert issubclass(LimitRequestLine, ParseError)
+        assert issubclass(LimitRequestHeaders, ParseError)
+        assert issubclass(InvalidRequestMethod, ParseError)
+        assert issubclass(InvalidHTTPVersion, ParseError)
+        assert issubclass(InvalidHeaderName, ParseError)
+        assert issubclass(InvalidHeader, ParseError)
+
+    def test_parse_error_inherits_value_error(self):
+        """ParseError should inherit from ValueError."""
+        assert issubclass(ParseError, ValueError)
+
+
+class TestLimitRequestLine:
+    """Tests for request line limit enforcement."""
+
+    def test_request_line_exceeds_limit(self):
+        """Should raise LimitRequestLine when request line is too long."""
+        long_path = b"/" + b"x" * 200
+        data = b"GET " + long_path + b" HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        with pytest.raises(LimitRequestLine):
+            parse_request(data, limit_request_line=100)
+
+    def test_request_line_within_limit(self):
+        """Should succeed when request line is within limit."""
+        data = b"GET /short HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        result = parse_request(data, limit_request_line=100)
+        assert result["method"] == b"GET"
+
+    def test_request_line_at_limit(self):
+        """Should succeed when request line is exactly at limit."""
+        # "GET / HTTP/1.1" is 14 chars
+        data = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        result = parse_request(data, limit_request_line=14)
+        assert result["method"] == b"GET"
+
+    def test_fast_parser_limit_request_line(self):
+        """Fast parser should also enforce request line limits."""
+        long_path = b"/" + b"x" * 200
+        data = b"GET " + long_path + b" HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        with pytest.raises(LimitRequestLine):
+            parse_request_fast(data, limit_request_line=100)
+
+
+class TestLimitRequestHeaders:
+    """Tests for header limit enforcement."""
+
+    def test_too_many_headers(self):
+        """Should raise LimitRequestHeaders when too many headers."""
+        headers = b"".join(f"X-Header-{i}: value\r\n".encode() for i in range(50))
+        data = b"GET / HTTP/1.1\r\n" + headers + b"\r\n"
+        with pytest.raises(LimitRequestHeaders):
+            parse_request(data, limit_request_fields=10)
+
+    def test_header_count_within_limit(self):
+        """Should succeed when header count is within limit."""
+        headers = b"".join(f"X-Header-{i}: value\r\n".encode() for i in range(5))
+        data = b"GET / HTTP/1.1\r\n" + headers + b"\r\n"
+        result = parse_request(data, limit_request_fields=10)
+        assert result["method"] == b"GET"
+
+    def test_header_size_exceeds_limit(self):
+        """Should raise LimitRequestHeaders when header is too large."""
+        long_value = b"x" * 1000
+        data = b"GET / HTTP/1.1\r\nX-Long: " + long_value + b"\r\n\r\n"
+        with pytest.raises(LimitRequestHeaders):
+            parse_request(data, limit_request_field_size=100)
+
+    def test_header_size_within_limit(self):
+        """Should succeed when header size is within limit."""
+        data = b"GET / HTTP/1.1\r\nX-Short: value\r\n\r\n"
+        result = parse_request(data, limit_request_field_size=100)
+        assert result["method"] == b"GET"
+
+    def test_fast_parser_header_limits(self):
+        """Fast parser should also enforce header limits."""
+        headers = b"".join(f"X-Header-{i}: value\r\n".encode() for i in range(50))
+        data = b"GET / HTTP/1.1\r\n" + headers + b"\r\n"
+        with pytest.raises(LimitRequestHeaders):
+            parse_request_fast(data, limit_request_fields=10)
+
+
+class TestInvalidRequestMethod:
+    """Tests for method validation."""
+
+    def test_lowercase_method_rejected(self):
+        """Lowercase methods should be rejected by default."""
+        data = b"get / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        with pytest.raises(InvalidRequestMethod):
+            parse_request(data)
+
+    def test_lowercase_method_with_permit(self):
+        """Lowercase methods should be allowed with permit flag."""
+        data = b"get / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        result = parse_request(data, permit_unconventional_http_method=True)
+        assert result["method"] == b"get"
+
+    def test_mixed_case_method_rejected(self):
+        """Mixed case methods should be rejected by default."""
+        data = b"GeT / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        with pytest.raises(InvalidRequestMethod):
+            parse_request(data)
+
+    def test_short_method_rejected(self):
+        """Methods shorter than 3 chars should be rejected."""
+        data = b"GO / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        with pytest.raises(InvalidRequestMethod):
+            parse_request(data)
+
+    def test_short_method_with_permit(self):
+        """Short methods should be allowed with permit flag."""
+        data = b"GO / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        result = parse_request(data, permit_unconventional_http_method=True)
+        assert result["method"] == b"GO"
+
+    def test_hash_in_method_rejected(self):
+        """Methods with # should be rejected by default."""
+        data = b"GET# / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        with pytest.raises(InvalidRequestMethod):
+            parse_request(data)
+
+    def test_standard_methods_accepted(self):
+        """Standard HTTP methods should be accepted."""
+        for method in [b"GET", b"POST", b"PUT", b"DELETE", b"PATCH", b"HEAD", b"OPTIONS"]:
+            data = method + b" / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            result = parse_request(data)
+            assert result["method"] == method
+
+    def test_fast_parser_method_validation(self):
+        """Fast parser should also validate methods."""
+        data = b"get / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        with pytest.raises(InvalidRequestMethod):
+            parse_request_fast(data)
+
+
+class TestInvalidHTTPVersion:
+    """Tests for HTTP version validation."""
+
+    def test_http_10_accepted(self):
+        """HTTP/1.0 should be accepted."""
+        data = b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n"
+        result = parse_request(data)
+        assert result["minor_version"] == 0
+
+    def test_http_11_accepted(self):
+        """HTTP/1.1 should be accepted."""
+        data = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        result = parse_request(data)
+        assert result["minor_version"] == 1
+
+    def test_fast_parser_version_validation(self):
+        """Fast parser should also validate HTTP version."""
+        data = b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n"
+        req = parse_request_fast(data)
+        assert req.minor_version == 0
+
+
+class TestHeaderValidation:
+    """Tests for header name and value validation."""
+
+    def test_valid_header_names(self):
+        """Valid header names should be accepted."""
+        data = b"GET / HTTP/1.1\r\nX-Custom-Header: value\r\nContent-Type: text/plain\r\n\r\n"
+        result = parse_request(data)
+        assert len(result["headers"]) == 2
+
+    def test_fast_parser_header_validation(self):
+        """Fast parser should also validate headers."""
+        data = b"GET / HTTP/1.1\r\nX-Valid: value\r\n\r\n"
+        req = parse_request_fast(data)
+        assert req.header_count == 1
+
+
+class TestDefaultLimits:
+    """Tests for default limit values."""
+
+    def test_default_limits_allow_reasonable_requests(self):
+        """Default limits should allow reasonable sized requests."""
+        # Request line under 8190
+        path = b"/" + b"x" * 1000
+        headers = b"".join(f"X-Header-{i}: value\r\n".encode() for i in range(50))
+        data = b"GET " + path + b" HTTP/1.1\r\n" + headers + b"\r\n"
+        result = parse_request(data)
+        assert result["method"] == b"GET"
+
+    def test_default_limit_request_line(self):
+        """Default request line limit should be 8190."""
+        # Create a request line that exceeds 8190
+        long_path = b"/" + b"x" * 9000
+        data = b"GET " + long_path + b" HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        with pytest.raises(LimitRequestLine):
+            parse_request(data)
+
+    def test_default_limit_request_fields(self):
+        """Default header count limit should be 100."""
+        headers = b"".join(f"X-Header-{i}: value\r\n".encode() for i in range(150))
+        data = b"GET / HTTP/1.1\r\n" + headers + b"\r\n"
+        with pytest.raises(LimitRequestHeaders):
+            parse_request(data)

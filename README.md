@@ -11,6 +11,8 @@ Fast HTTP/1.1 parser for Gunicorn using [picohttpparser](https://github.com/h2o/
 - Incremental parsing support
 - Chunked transfer encoding support
 - WSGI environ and ASGI scope generation
+- Limit enforcement matching gunicorn's Python parser
+- Specific exception types for validation errors
 - Python 3.9+
 
 ## Installation
@@ -180,6 +182,38 @@ class MyProtocol(asyncio.Protocol):
         self.parser.reset()  # Reuse for next request (keep-alive)
 ```
 
+### Limit Enforcement
+
+All parsing functions enforce limits matching gunicorn's Python parser:
+
+```python
+from gunicorn_h1c import parse_request, LimitRequestLine, LimitRequestHeaders
+
+# Default limits: request_line=8190, fields=100, field_size=8190
+try:
+    result = parse_request(data)
+except LimitRequestLine:
+    # Request line too long
+    pass
+except LimitRequestHeaders:
+    # Too many headers or header too large
+    pass
+
+# Custom limits
+result = parse_request(
+    data,
+    limit_request_line=4096,      # Max request line length
+    limit_request_fields=50,       # Max number of headers
+    limit_request_field_size=4096  # Max header size (name + value)
+)
+
+# Allow unconventional methods (lowercase, short, etc.)
+result = parse_request(
+    b"get / HTTP/1.1\r\n\r\n",
+    permit_unconventional_http_method=True
+)
+```
+
 ### Incremental Parsing
 
 ```python
@@ -235,7 +269,7 @@ Benchmarks on Apple M4 Pro (single thread):
 
 ### Request Parsing
 
-#### `parse_request(data, last_len=0) -> dict`
+#### `parse_request(data, last_len=0, ...) -> dict`
 
 Parse HTTP request, returns dict with:
 - `method`: bytes
@@ -244,7 +278,14 @@ Parse HTTP request, returns dict with:
 - `headers`: list of (name, value) tuples
 - `consumed`: int (bytes consumed)
 
-#### `parse_request_fast(data, last_len=0) -> HttpRequest`
+**Optional parameters:**
+- `limit_request_line`: int (default 8190) - Maximum request line length
+- `limit_request_fields`: int (default 100) - Maximum number of headers
+- `limit_request_field_size`: int (default 8190) - Maximum header size
+- `permit_unconventional_http_method`: bool (default False) - Allow lowercase/short methods
+- `permit_unconventional_http_version`: bool (default False) - Allow non-1.0/1.1 versions
+
+#### `parse_request_fast(data, last_len=0, ...) -> HttpRequest`
 
 Parse HTTP request with zero-copy optimization, returns `HttpRequest` object with:
 - `method`: bytes (lazy)
@@ -257,6 +298,8 @@ Parse HTTP request with zero-copy optimization, returns `HttpRequest` object wit
 - `has_chunked`: bool
 - `connection_close`: int (-1=unset, 0=keep-alive, 1=close)
 - `get_header(name)`: bytes or None (case-insensitive lookup)
+
+**Optional parameters:** Same as `parse_request()`.
 
 #### `parse_request_raw(data, last_len=0) -> tuple`
 
@@ -285,6 +328,11 @@ H1CProtocol(
     on_headers_complete=None,   # () -> bool (return True to skip body)
     on_body=None,               # (chunk: bytes) -> None
     on_message_complete=None,   # () -> None
+    limit_request_line=8190,    # Maximum request line length
+    limit_request_fields=100,   # Maximum number of headers
+    limit_request_field_size=8190,  # Maximum header size
+    permit_unconventional_http_method=False,
+    permit_unconventional_http_version=False,
 )
 ```
 
@@ -323,7 +371,7 @@ Parse HTTP headers only, returns list of (name, value) tuples.
 
 ### WSGI/ASGI Support
 
-#### `parse_to_wsgi_environ(data, server=None, client=None, url_scheme="http") -> dict`
+#### `parse_to_wsgi_environ(data, server=None, client=None, url_scheme="http", ...) -> dict`
 
 Parse HTTP request and build WSGI environ dict. Parameters:
 - `data`: Raw HTTP request bytes
@@ -331,9 +379,11 @@ Parse HTTP request and build WSGI environ dict. Parameters:
 - `client`: (addr, port) tuple for REMOTE_ADDR/REMOTE_PORT
 - `url_scheme`: URL scheme (default "http")
 
+**Optional parameters:** Same limit/flag parameters as `parse_request()`.
+
 Returns dict with `REQUEST_METHOD`, `PATH_INFO`, `QUERY_STRING`, `SERVER_PROTOCOL`, `HTTP_*` headers, and `_consumed`.
 
-#### `parse_to_asgi_scope(data, server=None, client=None, scheme="http", root_path="") -> dict`
+#### `parse_to_asgi_scope(data, server=None, client=None, scheme="http", root_path="", ...) -> dict`
 
 Parse HTTP request and build ASGI scope dict. Parameters:
 - `data`: Raw HTTP request bytes
@@ -342,12 +392,23 @@ Parse HTTP request and build ASGI scope dict. Parameters:
 - `scheme`: URL scheme (default "http")
 - `root_path`: ASGI root_path (default "")
 
+**Optional parameters:** Same limit/flag parameters as `parse_request()`.
+
 Returns dict with `type`, `asgi`, `http_version`, `method`, `scheme`, `path`, `raw_path`, `query_string`, `root_path`, `headers`, `server`, `client`, and `_consumed`.
 
 ### Exceptions
 
-- `ParseError`: Invalid HTTP request/response
+**Base exceptions:**
+- `ParseError`: Base exception for parse errors (inherits from `ValueError`)
 - `IncompleteError`: Need more data (incremental parsing)
+
+**Validation exceptions (inherit from `ParseError`):**
+- `LimitRequestLine`: Request line exceeds `limit_request_line`
+- `LimitRequestHeaders`: Too many headers or header exceeds `limit_request_field_size`
+- `InvalidRequestMethod`: Invalid method characters or format (lowercase, too short, contains `#`)
+- `InvalidHTTPVersion`: HTTP version not 1.0 or 1.1
+- `InvalidHeaderName`: Invalid header name characters (not RFC 9110 token)
+- `InvalidHeader`: Invalid header value (contains NUL, CR, or LF)
 
 ## License
 

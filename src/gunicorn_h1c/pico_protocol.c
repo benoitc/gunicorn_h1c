@@ -29,6 +29,14 @@
 /* ParseError exception */
 static PyObject *ParseError;
 
+/* Imported validation exceptions from _parser module */
+static PyObject *LimitRequestLine;
+static PyObject *LimitRequestHeaders;
+static PyObject *InvalidRequestMethod;
+static PyObject *InvalidHTTPVersion;
+static PyObject *InvalidHeaderName;
+static PyObject *InvalidHeader;
+
 /*
  * H1CProtocol type
  */
@@ -42,6 +50,13 @@ typedef struct {
     PyObject *on_headers_complete;
     PyObject *on_body;
     PyObject *on_message_complete;
+
+    /* Validation configuration */
+    Py_ssize_t limit_request_line;
+    Py_ssize_t limit_request_fields;
+    Py_ssize_t limit_request_field_size;
+    int permit_unconventional_http_method;
+    int permit_unconventional_http_version;
 
     /* Parser state */
     int state;
@@ -128,6 +143,8 @@ H1CProtocol_init(H1CProtocol *self, PyObject *args, PyObject *kwargs)
     static char *kwlist[] = {
         "on_message_begin", "on_url", "on_header",
         "on_headers_complete", "on_body", "on_message_complete",
+        "limit_request_line", "limit_request_fields", "limit_request_field_size",
+        "permit_unconventional_http_method", "permit_unconventional_http_version",
         NULL
     };
 
@@ -137,11 +154,21 @@ H1CProtocol_init(H1CProtocol *self, PyObject *args, PyObject *kwargs)
     PyObject *on_headers_complete = NULL;
     PyObject *on_body = NULL;
     PyObject *on_message_complete = NULL;
+    Py_ssize_t limit_request_line = PICO_DEFAULT_LIMIT_REQUEST_LINE;
+    Py_ssize_t limit_request_fields = PICO_DEFAULT_LIMIT_REQUEST_FIELDS;
+    Py_ssize_t limit_request_field_size = PICO_DEFAULT_LIMIT_REQUEST_FIELD_SIZE;
+    int permit_unconventional_http_method = 0;
+    int permit_unconventional_http_version = 0;
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|OOOOOO", kwlist,
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|OOOOOOnnnpp", kwlist,
                                      &on_message_begin, &on_url, &on_header,
                                      &on_headers_complete, &on_body,
-                                     &on_message_complete)) {
+                                     &on_message_complete,
+                                     &limit_request_line,
+                                     &limit_request_fields,
+                                     &limit_request_field_size,
+                                     &permit_unconventional_http_method,
+                                     &permit_unconventional_http_version)) {
         return -1;
     }
 
@@ -170,6 +197,13 @@ H1CProtocol_init(H1CProtocol *self, PyObject *args, PyObject *kwargs)
         Py_INCREF(on_message_complete);
         self->on_message_complete = on_message_complete;
     }
+
+    /* Store validation config */
+    self->limit_request_line = limit_request_line;
+    self->limit_request_fields = limit_request_fields;
+    self->limit_request_field_size = limit_request_field_size;
+    self->permit_unconventional_http_method = permit_unconventional_http_method;
+    self->permit_unconventional_http_version = permit_unconventional_http_version;
 
     /* Initialize state */
     self->state = STATE_IDLE;
@@ -283,6 +317,15 @@ H1CProtocol_feed(H1CProtocol *self, PyObject *args)
 static int
 H1CProtocol_feed_headers(H1CProtocol *self)
 {
+    /* Check request line length before parsing */
+    Py_ssize_t req_line_len = pico_find_request_line_length(self->buffer, self->buffer_len);
+    if (req_line_len >= 0 && req_line_len > self->limit_request_line) {
+        PyErr_Format(LimitRequestLine,
+            "Request line length (%zd) exceeds limit (%zd)",
+            req_line_len, self->limit_request_line);
+        return -1;
+    }
+
     const char *method, *path;
     size_t method_len, path_len;
     int minor_version;
@@ -306,6 +349,36 @@ H1CProtocol_feed_headers(H1CProtocol *self)
 
     if (ret == -1) {
         PyErr_SetString(ParseError, "Invalid HTTP request");
+        return -1;
+    }
+
+    /* Validate method */
+    if (pico_validate_method(method, method_len,
+                              self->permit_unconventional_http_method,
+                              InvalidRequestMethod) < 0) {
+        return -1;
+    }
+
+    /* Validate HTTP version */
+    if (pico_validate_version(minor_version,
+                               self->permit_unconventional_http_version,
+                               InvalidHTTPVersion) < 0) {
+        return -1;
+    }
+
+    /* Validate headers */
+    PicoValidationConfig config = {
+        .limit_request_line = self->limit_request_line,
+        .limit_request_fields = self->limit_request_fields,
+        .limit_request_field_size = self->limit_request_field_size,
+        .permit_unconventional_http_method = self->permit_unconventional_http_method,
+        .permit_unconventional_http_version = self->permit_unconventional_http_version
+    };
+
+    if (pico_validate_headers(headers, num_headers, &config,
+                               LimitRequestHeaders,
+                               InvalidHeaderName,
+                               InvalidHeader) < 0) {
         return -1;
     }
 
@@ -857,8 +930,33 @@ PyInit__protocol(void)
 
     ParseError = PyErr_NewException(
         "gunicorn_h1c._protocol.ParseError", PyExc_ValueError, NULL);
+    if (!ParseError) return NULL;
     Py_INCREF(ParseError);
     PyModule_AddObject(m, "ParseError", ParseError);
+
+    /* Import validation exceptions from _parser module */
+    PyObject *parser_module = PyImport_ImportModule("gunicorn_h1c._parser");
+    if (!parser_module) return NULL;
+
+    LimitRequestLine = PyObject_GetAttrString(parser_module, "LimitRequestLine");
+    if (!LimitRequestLine) { Py_DECREF(parser_module); return NULL; }
+
+    LimitRequestHeaders = PyObject_GetAttrString(parser_module, "LimitRequestHeaders");
+    if (!LimitRequestHeaders) { Py_DECREF(parser_module); return NULL; }
+
+    InvalidRequestMethod = PyObject_GetAttrString(parser_module, "InvalidRequestMethod");
+    if (!InvalidRequestMethod) { Py_DECREF(parser_module); return NULL; }
+
+    InvalidHTTPVersion = PyObject_GetAttrString(parser_module, "InvalidHTTPVersion");
+    if (!InvalidHTTPVersion) { Py_DECREF(parser_module); return NULL; }
+
+    InvalidHeaderName = PyObject_GetAttrString(parser_module, "InvalidHeaderName");
+    if (!InvalidHeaderName) { Py_DECREF(parser_module); return NULL; }
+
+    InvalidHeader = PyObject_GetAttrString(parser_module, "InvalidHeader");
+    if (!InvalidHeader) { Py_DECREF(parser_module); return NULL; }
+
+    Py_DECREF(parser_module);
 
     return m;
 }

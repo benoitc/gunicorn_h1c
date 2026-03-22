@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-03-22
+
+### Added
+
+- Limit enforcement matching gunicorn's Python parser behavior
+  - `limit_request_line`: Maximum request line length (default 8190)
+  - `limit_request_fields`: Maximum number of headers (default 100)
+  - `limit_request_field_size`: Maximum header size (default 8190)
+- Gunicorn compatibility flags
+  - `permit_unconventional_http_method`: Allow lowercase methods, short methods, and `#` character
+  - `permit_unconventional_http_version`: Allow HTTP versions other than 1.0/1.1
+- Specific exception types for validation errors (all inherit from `ParseError`)
+  - `LimitRequestLine`: Request line exceeds limit
+  - `LimitRequestHeaders`: Too many headers or header too large
+  - `InvalidRequestMethod`: Invalid method characters or format
+  - `InvalidHTTPVersion`: Invalid HTTP version
+  - `InvalidHeaderName`: Invalid header name characters
+  - `InvalidHeader`: Invalid header value (NUL, CR, LF)
+- Validation functions in `pico_utils.h` for RFC 9110 token character validation
+
+### Changed
+
+- All parsing functions now validate requests by default
+- `parse_request`, `parse_request_fast`, `parse_to_wsgi_environ`, `parse_to_asgi_scope`, and `H1CProtocol` accept new limit/flag parameters
+
 ## [0.3.0] - 2026-03-21
 
 ### Changed

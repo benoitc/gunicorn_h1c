@@ -25,7 +25,7 @@ Usage:
     print(req.has_chunked)    # False
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 __all__ = [
     # Basic parser
     "parse_request",
@@ -39,9 +39,16 @@ __all__ = [
     "HttpRequest",
     # Callback-based protocol parser
     "H1CProtocol",
-    # Exceptions
+    # Base exceptions
     "ParseError",
     "IncompleteError",
+    # Specific validation exceptions
+    "LimitRequestLine",
+    "LimitRequestHeaders",
+    "InvalidRequestMethod",
+    "InvalidHTTPVersion",
+    "InvalidHeaderName",
+    "InvalidHeader",
 ]
 
 # Import from C extensions
@@ -54,6 +61,12 @@ try:
         parse_to_asgi_scope,
         ParseError,
         IncompleteError,
+        LimitRequestLine,
+        LimitRequestHeaders,
+        InvalidRequestMethod,
+        InvalidHTTPVersion,
+        InvalidHeaderName,
+        InvalidHeader,
     )
 except ImportError as e:
     raise ImportError(
