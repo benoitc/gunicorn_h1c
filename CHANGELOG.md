@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.1] - 2026-03-22
+
+### Fixed
+
+- Header size calculation now includes CRLF to match Python parser behavior
+
 ## [0.5.0] - 2026-03-22
 
 ### Fixed
