@@ -637,6 +637,26 @@ class TestParseErrorSpecificExceptions:
         with pytest.raises(InvalidHeader):
             parse_request(b"GET / HTTP/1.1\r\nX-Test: val\x00ue\r\n\r\n")
 
+    def test_parse_error_bare_lf_in_header_value(self):
+        """Bare LF in header value should raise InvalidHeader."""
+        with pytest.raises(InvalidHeader):
+            parse_request(b"GET / HTTP/1.1\r\nX-Test: value\nmore\r\n\r\n")
+
+    def test_parse_error_bare_cr_in_header_value(self):
+        """Bare CR in header value should raise InvalidHeader."""
+        with pytest.raises(InvalidHeader):
+            parse_request(b"GET / HTTP/1.1\r\nX-Test: value\rmore\r\n\r\n")
+
+    def test_parse_error_ftp_protocol(self):
+        """FTP/1.1 should raise InvalidHTTPVersion."""
+        with pytest.raises(InvalidHTTPVersion):
+            parse_request(b"GET / FTP/1.1\r\n\r\n")
+
+    def test_parse_error_rtsp_protocol(self):
+        """RTSP/1.0 should raise InvalidHTTPVersion."""
+        with pytest.raises(InvalidHTTPVersion):
+            parse_request(b"GET / RTSP/1.0\r\n\r\n")
+
     def test_fast_parser_parse_error_lowercase_method(self):
         """Fast parser: lowercase method should raise InvalidRequestMethod."""
         with pytest.raises(InvalidRequestMethod):
@@ -656,6 +676,16 @@ class TestParseErrorSpecificExceptions:
         """Fast parser: NUL in header value should raise InvalidHeader."""
         with pytest.raises(InvalidHeader):
             parse_request_fast(b"GET / HTTP/1.1\r\nX-Test: val\x00ue\r\n\r\n")
+
+    def test_fast_parser_parse_error_bare_lf_in_header_value(self):
+        """Fast parser: bare LF in header value should raise InvalidHeader."""
+        with pytest.raises(InvalidHeader):
+            parse_request_fast(b"GET / HTTP/1.1\r\nX-Test: value\nmore\r\n\r\n")
+
+    def test_fast_parser_parse_error_ftp_protocol(self):
+        """Fast parser: FTP/1.1 should raise InvalidHTTPVersion."""
+        with pytest.raises(InvalidHTTPVersion):
+            parse_request_fast(b"GET / FTP/1.1\r\n\r\n")
 
 
 class TestProtocolParseErrorSpecificExceptions:
@@ -688,3 +718,17 @@ class TestProtocolParseErrorSpecificExceptions:
         protocol = gunicorn_h1c.H1CProtocol(on_headers_complete=lambda: None)
         with pytest.raises(InvalidHeader):
             protocol.feed(b"GET / HTTP/1.1\r\nX-Test: val\x00ue\r\n\r\n")
+
+    def test_protocol_parse_error_bare_lf_in_header_value(self):
+        """H1CProtocol: bare LF in header value should raise InvalidHeader."""
+        import gunicorn_h1c
+        protocol = gunicorn_h1c.H1CProtocol(on_headers_complete=lambda: None)
+        with pytest.raises(InvalidHeader):
+            protocol.feed(b"GET / HTTP/1.1\r\nX-Test: value\nmore\r\n\r\n")
+
+    def test_protocol_parse_error_ftp_protocol(self):
+        """H1CProtocol: FTP/1.1 should raise InvalidHTTPVersion."""
+        import gunicorn_h1c
+        protocol = gunicorn_h1c.H1CProtocol(on_headers_complete=lambda: None)
+        with pytest.raises(InvalidHTTPVersion):
+            protocol.feed(b"GET / FTP/1.1\r\n\r\n")

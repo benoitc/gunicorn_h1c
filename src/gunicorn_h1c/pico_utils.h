@@ -477,6 +477,43 @@ pico_analyze_parse_error(const char *buf, size_t buf_len,
         }
     }
 
+    /* Check for non-HTTP protocol markers (e.g., FTP/1.1) */
+    if (!http_marker && !permit_unconventional_version) {
+        /* Find second space (after path) to locate version field */
+        size_t second_space = 0;
+        int space_count = 0;
+        for (size_t i = 0; i < buf_len && i < 8192; i++) {
+            if (buf[i] == ' ') {
+                space_count++;
+                if (space_count == 2) {
+                    second_space = i;
+                    break;
+                }
+            }
+            if (buf[i] == '\r' || buf[i] == '\n') break;
+        }
+
+        if (second_space > 0 && second_space + 1 < buf_len) {
+            /* Check if there's something after second space that looks like a version */
+            const char *ver_start = &buf[second_space + 1];
+            size_t ver_remaining = buf_len - second_space - 1;
+            /* Look for X/X.X pattern but not HTTP/ */
+            if (ver_remaining >= 3) {
+                /* If it starts with letters and has a '/', it's a protocol version */
+                int has_slash = 0;
+                for (size_t i = 0; i < ver_remaining && i < 10; i++) {
+                    if (ver_start[i] == '/') { has_slash = 1; break; }
+                    if (ver_start[i] == '\r' || ver_start[i] == '\n') break;
+                }
+                if (has_slash) {
+                    PyErr_SetString(InvalidHTTPVersion,
+                        "Invalid HTTP version (only HTTP/1.0 and HTTP/1.1 allowed)");
+                    return -1;
+                }
+            }
+        }
+    }
+
     /* 3. Find and scan headers (after first \r\n) */
     const char *headers_start = NULL;
     for (size_t i = 0; i + 1 < buf_len; i++) {
@@ -521,7 +558,7 @@ pico_analyze_parse_error(const char *buf, size_t buf_len,
                 }
             }
 
-            /* Validate header value (look for NUL) */
+            /* Validate header value (look for NUL, CR, LF) */
             if (colon && colon + 1 < line_end) {
                 const char *value_start = colon + 1;
                 /* Skip leading whitespace */
@@ -533,6 +570,16 @@ pico_analyze_parse_error(const char *buf, size_t buf_len,
                     if (*q == '\0') {
                         PyErr_SetString(InvalidHeader,
                             "NUL character not allowed in header value");
+                        return -1;
+                    }
+                    if (*q == '\n') {
+                        PyErr_SetString(InvalidHeader,
+                            "LF character not allowed in header value");
+                        return -1;
+                    }
+                    if (*q == '\r') {
+                        PyErr_SetString(InvalidHeader,
+                            "CR character not allowed in header value");
                         return -1;
                     }
                 }
@@ -567,8 +614,8 @@ pico_validate_headers(struct phr_header *headers, size_t num_headers,
     }
 
     for (size_t i = 0; i < num_headers; i++) {
-        /* Check header size (name_len + value_len) */
-        size_t header_size = headers[i].name_len + headers[i].value_len;
+        /* Check header line size (name + ": " + value) */
+        size_t header_size = headers[i].name_len + 2 + headers[i].value_len;
         if ((Py_ssize_t)header_size > config->limit_request_field_size) {
             PyErr_Format(LimitRequestHeaders,
                 "Header size (%zu) exceeds limit (%zd)",
