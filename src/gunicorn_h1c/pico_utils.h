@@ -614,8 +614,8 @@ pico_validate_headers(struct phr_header *headers, size_t num_headers,
     }
 
     for (size_t i = 0; i < num_headers; i++) {
-        /* Check header line size (name + ": " + value) */
-        size_t header_size = headers[i].name_len + 2 + headers[i].value_len;
+        /* Check header line size (name + ": " + value + CRLF) */
+        size_t header_size = headers[i].name_len + 2 + headers[i].value_len + 2;
         if ((Py_ssize_t)header_size > config->limit_request_field_size) {
             PyErr_Format(LimitRequestHeaders,
                 "Header size (%zu) exceeds limit (%zd)",

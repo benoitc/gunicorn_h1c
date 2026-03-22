@@ -476,6 +476,21 @@ class TestLimitRequestHeaders:
         result = parse_request(data, limit_request_field_size=100)
         assert result["method"] == b"GET"
 
+    def test_header_size_includes_crlf(self):
+        """Header size calculation must include CRLF to match Python parser.
+
+        Header line: "X-Test: value\\r\\n"
+        Size = name(6) + ": "(2) + value(5) + CRLF(2) = 15 bytes
+        """
+        # Exactly at limit (15 bytes) - should pass
+        data = b"GET / HTTP/1.1\r\nX-Test: value\r\n\r\n"
+        result = parse_request(data, limit_request_field_size=15)
+        assert result["method"] == b"GET"
+
+        # One byte over limit - should fail
+        with pytest.raises(LimitRequestHeaders):
+            parse_request(data, limit_request_field_size=14)
+
     def test_fast_parser_header_limits(self):
         """Fast parser should also enforce header limits."""
         headers = b"".join(f"X-Header-{i}: value\r\n".encode() for i in range(50))
