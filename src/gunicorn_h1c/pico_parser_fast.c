@@ -341,10 +341,11 @@ pico_parse_request_fast(PyObject *self, PyObject *args, PyObject *kwargs)
         .permit_unconventional_http_version = permit_unconventional_http_version
     };
 
-    if (pico_validate_headers(req->headers, req->num_headers, &config,
-                               LimitRequestHeaders,
-                               InvalidHeaderName,
-                               InvalidHeader) < 0) {
+    if (pico_validate_headers_full(req->headers, req->num_headers, req->minor_version,
+                                    &config,
+                                    LimitRequestHeaders,
+                                    InvalidHeaderName,
+                                    InvalidHeader) < 0) {
         Py_DECREF(req);
         return NULL;
     }

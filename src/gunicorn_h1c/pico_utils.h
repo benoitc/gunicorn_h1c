@@ -802,7 +802,60 @@ pico_analyze_parse_error(const char *buf, size_t buf_len,
 }
 
 /*
- * Validate all headers against limits and character rules.
+ * Validate all headers against limits, character rules, and framing rules.
+ * Returns 0 on success, -1 on error (sets Python exception).
+ */
+static inline int
+pico_validate_headers_full(struct phr_header *headers, size_t num_headers,
+                           int minor_version,
+                           const PicoValidationConfig *config,
+                           PyObject *LimitRequestHeaders,
+                           PyObject *InvalidHeaderName,
+                           PyObject *InvalidHeader)
+{
+    /* Check header count */
+    if ((Py_ssize_t)num_headers > config->limit_request_fields) {
+        PyErr_Format(LimitRequestHeaders,
+            "Number of headers (%zu) exceeds limit (%zd)",
+            num_headers, config->limit_request_fields);
+        return -1;
+    }
+
+    for (size_t i = 0; i < num_headers; i++) {
+        /* Check header line size (name + ": " + value + CRLF) */
+        size_t header_size = headers[i].name_len + 2 + headers[i].value_len + 2;
+        if ((Py_ssize_t)header_size > config->limit_request_field_size) {
+            PyErr_Format(LimitRequestHeaders,
+                "Header size (%zu) exceeds limit (%zd)",
+                header_size, config->limit_request_field_size);
+            return -1;
+        }
+
+        /* Validate header name */
+        if (pico_validate_header_name(headers[i].name, headers[i].name_len,
+                                       InvalidHeaderName) < 0) {
+            return -1;
+        }
+
+        /* Validate header value */
+        if (pico_validate_header_value(headers[i].value, headers[i].value_len,
+                                        InvalidHeader) < 0) {
+            return -1;
+        }
+    }
+
+    /* Extract header info and validate framing for request smuggling prevention */
+    PicoHeaderInfo info;
+    pico_extract_headers(headers, num_headers, &info);
+    if (pico_validate_header_framing(&info, minor_version, InvalidHeader) < 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+/*
+ * Validate all headers against limits and character rules (legacy, no framing check).
  * Returns 0 on success, -1 on error (sets Python exception).
  */
 static inline int

@@ -137,10 +137,10 @@ pico_parse_request(PyObject *self, PyObject *args, PyObject *kwargs)
         .permit_unconventional_http_version = permit_unconventional_http_version
     };
 
-    if (pico_validate_headers(headers, num_headers, &config,
-                               LimitRequestHeaders,
-                               InvalidHeaderName,
-                               InvalidHeader) < 0) {
+    if (pico_validate_headers_full(headers, num_headers, minor_version, &config,
+                                    LimitRequestHeaders,
+                                    InvalidHeaderName,
+                                    InvalidHeader) < 0) {
         PyBuffer_Release(&buf);
         return NULL;
     }
@@ -412,10 +412,10 @@ pico_parse_to_wsgi_environ(PyObject *self, PyObject *args, PyObject *kwargs)
         .permit_unconventional_http_version = permit_unconventional_http_version
     };
 
-    if (pico_validate_headers(headers, num_headers, &config,
-                               LimitRequestHeaders,
-                               InvalidHeaderName,
-                               InvalidHeader) < 0) {
+    if (pico_validate_headers_full(headers, num_headers, minor_version, &config,
+                                    LimitRequestHeaders,
+                                    InvalidHeaderName,
+                                    InvalidHeader) < 0) {
         PyBuffer_Release(&buf);
         return NULL;
     }
@@ -706,10 +706,10 @@ pico_parse_to_asgi_scope(PyObject *self, PyObject *args, PyObject *kwargs)
         .permit_unconventional_http_version = permit_unconventional_http_version
     };
 
-    if (pico_validate_headers(headers, num_headers, &config,
-                               LimitRequestHeaders,
-                               InvalidHeaderName,
-                               InvalidHeader) < 0) {
+    if (pico_validate_headers_full(headers, num_headers, minor_version, &config,
+                                    LimitRequestHeaders,
+                                    InvalidHeaderName,
+                                    InvalidHeader) < 0) {
         PyBuffer_Release(&buf);
         return NULL;
     }
