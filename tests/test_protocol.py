@@ -1,7 +1,9 @@
 """Tests for H1CProtocol callback-based parser."""
+
 import pytest
-from gunicorn_h1c import H1CProtocol
 from gunicorn_h1c._protocol import ParseError
+
+from gunicorn_h1c import H1CProtocol
 
 
 class TestH1CProtocolBasic:
@@ -187,7 +189,9 @@ class TestH1CProtocolCallbacks:
             headers.append((name, value))
 
         p = H1CProtocol(on_header=on_header)
-        p.feed(b"GET / HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\nUser-Agent: test\r\n\r\n")
+        p.feed(
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\nUser-Agent: test\r\n\r\n"
+        )
 
         assert len(headers) == 3
         assert headers[0] == (b"Host", b"localhost")
@@ -433,12 +437,8 @@ class TestH1CProtocolErrors:
         """Test ParseError has status_code attribute."""
         p = H1CProtocol()
 
-        try:
+        with pytest.raises(ParseError):
             p.feed(b"INVALID\r\n\r\n")
-            assert False, "Should have raised ParseError"
-        except ParseError as e:
-            # Just verify the exception was raised
-            assert str(e)  # Has a message
 
 
 class TestH1CProtocolBodyParsing:

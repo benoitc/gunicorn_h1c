@@ -1,9 +1,11 @@
 """
 Build script for gunicorn_h1c C extensions.
 """
+
 import os
 import platform
-from setuptools import setup, Extension
+
+from setuptools import Extension, setup
 
 # Compiler flags for optimization
 extra_compile_args = ["-O3"]

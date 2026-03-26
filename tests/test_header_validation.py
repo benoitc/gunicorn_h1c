@@ -3,13 +3,15 @@
 These tests verify that the parsers properly reject requests with
 ambiguous or conflicting framing indicators.
 """
+
 import pytest
+from gunicorn_h1c._protocol import ParseError as ProtocolParseError
 
 from gunicorn_h1c import (
-    parse_request,
-    parse_request_fast,
     H1CProtocol,
     InvalidHeader,
+    parse_request,
+    parse_request_fast,
 )
 
 
@@ -54,32 +56,42 @@ class TestContentLengthWithTransferEncoding:
     def test_basic_parser_cl_te_conflict(self):
         """Basic parser rejects CL with Transfer-Encoding."""
         data = b"POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n"
-        with pytest.raises(InvalidHeader, match="Content-Length with Transfer-Encoding"):
+        with pytest.raises(
+            InvalidHeader, match="Content-Length with Transfer-Encoding"
+        ):
             parse_request(data)
 
     def test_fast_parser_cl_te_conflict(self):
         """Fast parser rejects CL with Transfer-Encoding."""
         data = b"POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n"
-        with pytest.raises(InvalidHeader, match="Content-Length with Transfer-Encoding"):
+        with pytest.raises(
+            InvalidHeader, match="Content-Length with Transfer-Encoding"
+        ):
             parse_request_fast(data)
 
     def test_protocol_cl_te_conflict(self):
         """H1CProtocol rejects CL with Transfer-Encoding."""
         data = b"POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n"
         p = H1CProtocol()
-        with pytest.raises(InvalidHeader, match="Content-Length with Transfer-Encoding"):
+        with pytest.raises(
+            InvalidHeader, match="Content-Length with Transfer-Encoding"
+        ):
             p.feed(data)
 
     def test_te_before_cl(self):
         """Order doesn't matter - TE before CL is also rejected."""
         data = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n"
-        with pytest.raises(InvalidHeader, match="Content-Length with Transfer-Encoding"):
+        with pytest.raises(
+            InvalidHeader, match="Content-Length with Transfer-Encoding"
+        ):
             parse_request(data)
 
     def test_te_before_cl_fast(self):
         """Fast parser: TE before CL also rejected."""
         data = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n"
-        with pytest.raises(InvalidHeader, match="Content-Length with Transfer-Encoding"):
+        with pytest.raises(
+            InvalidHeader, match="Content-Length with Transfer-Encoding"
+        ):
             parse_request_fast(data)
 
 
@@ -159,13 +171,17 @@ class TestValidRequests:
 
     def test_chunked_http11(self):
         """Chunked encoding in HTTP/1.1 is valid."""
-        data = b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
+        data = (
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
+        )
         result = parse_request(data)
         assert result["method"] == b"POST"
 
     def test_chunked_http11_fast(self):
         """Fast parser: chunked in HTTP/1.1 is valid."""
-        data = b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
+        data = (
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
+        )
         req = parse_request_fast(data)
         assert req.method == b"POST"
         assert req.has_chunked
@@ -185,7 +201,9 @@ class TestValidRequests:
 
     def test_protocol_valid_chunked(self):
         """H1CProtocol: chunked in HTTP/1.1 is valid."""
-        data = b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
+        data = (
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
+        )
         p = H1CProtocol()
         p.feed(data)
         assert p.method == b"POST"
@@ -209,21 +227,21 @@ class TestChunkSizeValidation:
         """Invalid hex in chunk size is rejected."""
         p = H1CProtocol()
         p.feed(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n")
-        with pytest.raises(Exception):  # ParseError
+        with pytest.raises(ProtocolParseError):
             p.feed(b"GG\r\n")
 
     def test_protocol_empty_chunk_size(self):
         """Empty chunk size line is rejected."""
         p = H1CProtocol()
         p.feed(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n")
-        with pytest.raises(Exception):  # ParseError
+        with pytest.raises(ProtocolParseError):
             p.feed(b"\r\n")
 
     def test_protocol_whitespace_in_chunk_size(self):
         """Leading whitespace in chunk size is rejected."""
         p = H1CProtocol()
         p.feed(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n")
-        with pytest.raises(Exception):  # ParseError
+        with pytest.raises(ProtocolParseError):
             p.feed(b" 5\r\n")
 
     def test_protocol_valid_chunk_extension(self):

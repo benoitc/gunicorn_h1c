@@ -54,19 +54,19 @@ __all__ = [
 # Import from C extensions
 try:
     from gunicorn_h1c._parser import (
+        IncompleteError,
+        InvalidHeader,
+        InvalidHeaderName,
+        InvalidHTTPVersion,
+        InvalidRequestMethod,
+        LimitRequestHeaders,
+        LimitRequestLine,
+        ParseError,
+        parse_headers,
         parse_request,
         parse_response,
-        parse_headers,
-        parse_to_wsgi_environ,
         parse_to_asgi_scope,
-        ParseError,
-        IncompleteError,
-        LimitRequestLine,
-        LimitRequestHeaders,
-        InvalidRequestMethod,
-        InvalidHTTPVersion,
-        InvalidHeaderName,
-        InvalidHeader,
+        parse_to_wsgi_environ,
     )
 except ImportError as e:
     raise ImportError(
@@ -77,9 +77,11 @@ except ImportError as e:
 
 try:
     from gunicorn_h1c._parser_fast import (
-        parse_request as parse_request_fast,
-        parse_request_raw,
         HttpRequest,
+        parse_request_raw,
+    )
+    from gunicorn_h1c._parser_fast import (
+        parse_request as parse_request_fast,
     )
 except ImportError as e:
     raise ImportError(
@@ -91,7 +93,6 @@ except ImportError as e:
 try:
     from gunicorn_h1c._protocol import (
         H1CProtocol,
-        ParseError as ProtocolParseError,
     )
 except ImportError as e:
     raise ImportError(

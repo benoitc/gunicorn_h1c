@@ -1,16 +1,17 @@
 """Tests for gunicorn_h1c HTTP parser."""
+
 import pytest
 
 from gunicorn_h1c import (
+    InvalidHeader,
+    InvalidHeaderName,
+    InvalidHTTPVersion,
+    InvalidRequestMethod,
+    LimitRequestHeaders,
+    LimitRequestLine,
+    ParseError,
     parse_request,
     parse_request_fast,
-    ParseError,
-    LimitRequestLine,
-    LimitRequestHeaders,
-    InvalidRequestMethod,
-    InvalidHTTPVersion,
-    InvalidHeaderName,
-    InvalidHeader,
 )
 
 
@@ -57,21 +58,21 @@ class TestBasicParser:
         assert result["minor_version"] == 0
 
     def test_incomplete_request(self):
-        from gunicorn_h1c import parse_request, IncompleteError
+        from gunicorn_h1c import IncompleteError, parse_request
 
         data = b"GET / HTTP/1.1\r\nHost: local"
         with pytest.raises(IncompleteError):
             parse_request(data)
 
     def test_invalid_request(self):
-        from gunicorn_h1c import parse_request, ParseError
+        from gunicorn_h1c import ParseError, parse_request
 
         data = b"INVALID REQUEST\r\n\r\n"
         with pytest.raises(ParseError):
             parse_request(data)
 
     def test_incremental_parsing(self):
-        from gunicorn_h1c import parse_request, IncompleteError
+        from gunicorn_h1c import IncompleteError, parse_request
 
         # Start with partial data
         buffer = b"GET / HTTP/1.1\r\n"
@@ -155,8 +156,9 @@ class TestFastParser:
         assert req.header_count == 3
 
     def test_incremental_parsing_fast(self):
-        from gunicorn_h1c import parse_request_fast
         from gunicorn_h1c._parser_fast import IncompleteError
+
+        from gunicorn_h1c import parse_request_fast
 
         # Partial request
         buffer = b"GET / HTTP/1.1\r\n"
@@ -179,7 +181,7 @@ class TestFastParser:
         assert req.header_count == 200
 
     def test_incremental_parsing_raw(self):
-        from gunicorn_h1c._parser_fast import parse_request_raw, IncompleteError
+        from gunicorn_h1c._parser_fast import IncompleteError, parse_request_raw
 
         buffer = b"GET / HTTP/1.1\r\n"
         with pytest.raises(IncompleteError):
@@ -257,9 +259,7 @@ class TestParseToWsgiEnviron:
 
         data = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
         environ = parse_to_wsgi_environ(
-            data,
-            server=("127.0.0.1", 8000),
-            client=("10.0.0.1", 54321)
+            data, server=("127.0.0.1", 8000), client=("10.0.0.1", 54321)
         )
 
         assert environ["SERVER_NAME"] == "127.0.0.1"
@@ -305,7 +305,9 @@ class TestParseToWsgiEnviron:
     def test_duplicate_headers(self):
         from gunicorn_h1c import parse_to_wsgi_environ
 
-        data = b"GET / HTTP/1.1\r\nAccept: text/html\r\nAccept: application/json\r\n\r\n"
+        data = (
+            b"GET / HTTP/1.1\r\nAccept: text/html\r\nAccept: application/json\r\n\r\n"
+        )
         environ = parse_to_wsgi_environ(data)
 
         assert environ["HTTP_ACCEPT"] == "text/html,application/json"
@@ -352,9 +354,7 @@ class TestParseToAsgiScope:
 
         data = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
         scope = parse_to_asgi_scope(
-            data,
-            server=("127.0.0.1", 8000),
-            client=("10.0.0.1", 54321)
+            data, server=("127.0.0.1", 8000), client=("10.0.0.1", 54321)
         )
 
         assert scope["server"] == ("127.0.0.1", 8000)
@@ -540,7 +540,15 @@ class TestInvalidRequestMethod:
 
     def test_standard_methods_accepted(self):
         """Standard HTTP methods should be accepted."""
-        for method in [b"GET", b"POST", b"PUT", b"DELETE", b"PATCH", b"HEAD", b"OPTIONS"]:
+        for method in [
+            b"GET",
+            b"POST",
+            b"PUT",
+            b"DELETE",
+            b"PATCH",
+            b"HEAD",
+            b"OPTIONS",
+        ]:
             data = method + b" / HTTP/1.1\r\nHost: localhost\r\n\r\n"
             result = parse_request(data)
             assert result["method"] == method
@@ -709,6 +717,7 @@ class TestProtocolParseErrorSpecificExceptions:
     def test_protocol_parse_error_lowercase_method(self):
         """H1CProtocol: lowercase method should raise InvalidRequestMethod."""
         import gunicorn_h1c
+
         protocol = gunicorn_h1c.H1CProtocol(on_headers_complete=lambda: None)
         with pytest.raises(InvalidRequestMethod):
             protocol.feed(b"get / HTTP/1.1\r\n\r\n")
@@ -716,6 +725,7 @@ class TestProtocolParseErrorSpecificExceptions:
     def test_protocol_parse_error_invalid_http_version(self):
         """H1CProtocol: HTTP/2.0 should raise InvalidHTTPVersion."""
         import gunicorn_h1c
+
         protocol = gunicorn_h1c.H1CProtocol(on_headers_complete=lambda: None)
         with pytest.raises(InvalidHTTPVersion):
             protocol.feed(b"GET / HTTP/2.0\r\n\r\n")
@@ -723,6 +733,7 @@ class TestProtocolParseErrorSpecificExceptions:
     def test_protocol_parse_error_space_in_header_name(self):
         """H1CProtocol: space in header name should raise InvalidHeaderName."""
         import gunicorn_h1c
+
         protocol = gunicorn_h1c.H1CProtocol(on_headers_complete=lambda: None)
         with pytest.raises(InvalidHeaderName):
             protocol.feed(b"GET / HTTP/1.1\r\nBad Header: value\r\n\r\n")
@@ -730,6 +741,7 @@ class TestProtocolParseErrorSpecificExceptions:
     def test_protocol_parse_error_nul_in_header_value(self):
         """H1CProtocol: NUL in header value should raise InvalidHeader."""
         import gunicorn_h1c
+
         protocol = gunicorn_h1c.H1CProtocol(on_headers_complete=lambda: None)
         with pytest.raises(InvalidHeader):
             protocol.feed(b"GET / HTTP/1.1\r\nX-Test: val\x00ue\r\n\r\n")
@@ -737,6 +749,7 @@ class TestProtocolParseErrorSpecificExceptions:
     def test_protocol_parse_error_bare_lf_in_header_value(self):
         """H1CProtocol: bare LF in header value should raise InvalidHeader."""
         import gunicorn_h1c
+
         protocol = gunicorn_h1c.H1CProtocol(on_headers_complete=lambda: None)
         with pytest.raises(InvalidHeader):
             protocol.feed(b"GET / HTTP/1.1\r\nX-Test: value\nmore\r\n\r\n")
@@ -744,6 +757,7 @@ class TestProtocolParseErrorSpecificExceptions:
     def test_protocol_parse_error_ftp_protocol(self):
         """H1CProtocol: FTP/1.1 should raise InvalidHTTPVersion."""
         import gunicorn_h1c
+
         protocol = gunicorn_h1c.H1CProtocol(on_headers_complete=lambda: None)
         with pytest.raises(InvalidHTTPVersion):
             protocol.feed(b"GET / FTP/1.1\r\n\r\n")

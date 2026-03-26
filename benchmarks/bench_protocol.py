@@ -10,10 +10,13 @@ This benchmark measures:
 """
 
 import time
-from gunicorn_h1c import parse_request_fast, H1CProtocol
+
+from gunicorn_h1c import H1CProtocol, parse_request_fast
 
 # Test data
-SIMPLE_GET = b"GET / HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\nUser-Agent: bench/1.0\r\n\r\n"
+SIMPLE_GET = (
+    b"GET / HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\nUser-Agent: bench/1.0\r\n\r\n"
+)
 
 POST_WITH_BODY = (
     b"POST /api/data HTTP/1.1\r\n"
@@ -213,34 +216,34 @@ def main():
 
     print("Simple GET (headers only):")
     print("-" * 75)
-    pull_time = run_benchmark("pull-based (parse_request_fast)",
-                              bench_pull_simple_get, iterations)
-    callback_time = run_benchmark("callback (H1CProtocol, new each time)",
-                                   bench_callback_simple_get, iterations)
-    reuse_time = run_benchmark("callback (H1CProtocol, reused)",
-                                bench_callback_simple_get_reuse, iterations)
+    pull_time = run_benchmark(
+        "pull-based (parse_request_fast)", bench_pull_simple_get, iterations
+    )
+    callback_time = run_benchmark(
+        "callback (H1CProtocol, new each time)", bench_callback_simple_get, iterations
+    )
+    reuse_time = run_benchmark(
+        "callback (H1CProtocol, reused)", bench_callback_simple_get_reuse, iterations
+    )
     print()
 
     print("POST with body (Content-Length):")
     print("-" * 75)
-    run_benchmark("pull-based (headers only)",
-                  bench_pull_post_body, iterations)
-    run_benchmark("callback (headers + body)",
-                  bench_callback_post_body, iterations)
+    run_benchmark("pull-based (headers only)", bench_pull_post_body, iterations)
+    run_benchmark("callback (headers + body)", bench_callback_post_body, iterations)
     print()
 
     print("Chunked transfer encoding:")
     print("-" * 75)
-    run_benchmark("callback (headers + chunked body)",
-                  bench_callback_chunked, iterations)
+    run_benchmark(
+        "callback (headers + chunked body)", bench_callback_chunked, iterations
+    )
     print()
 
     print("Incremental parsing (headers split across feeds):")
     print("-" * 75)
-    run_benchmark("pull-based (buffer + retry)",
-                  bench_pull_incremental, iterations)
-    run_benchmark("callback (multiple feeds)",
-                  bench_callback_incremental, iterations)
+    run_benchmark("pull-based (buffer + retry)", bench_pull_incremental, iterations)
+    run_benchmark("callback (multiple feeds)", bench_callback_incremental, iterations)
     print()
 
     print("=" * 75)
