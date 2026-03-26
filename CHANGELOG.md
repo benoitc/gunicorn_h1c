@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.2] - 2026-03-26
+
+### Added
+
+- `asgi_headers` property on HttpRequest and H1CProtocol for ASGI-compliant lowercase header names
+- `pico_create_header_tuple_lowercase()` helper function in pico_utils.h
+
+### Fixed
+
+- Starlette/FastAPI compatibility when using fast parser with ASGI worker (fixes #2)
+
 ## [0.6.1] - 2026-03-26
 
 ### Added
