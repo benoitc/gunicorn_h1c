@@ -68,7 +68,8 @@ typedef struct {
     /* Request data (valid after headers complete) */
     PyObject *py_method;
     PyObject *py_path;
-    PyObject *py_headers;  /* list of (name, value) tuples */
+    PyObject *py_headers;       /* list of (name, value) tuples */
+    PyObject *py_asgi_headers;  /* list with lowercase names for ASGI */
     int minor_version;
     Py_ssize_t content_length;  /* -1 if not set */
     int is_chunked;
@@ -129,6 +130,7 @@ H1CProtocol_dealloc(H1CProtocol *self)
     Py_XDECREF(self->py_method);
     Py_XDECREF(self->py_path);
     Py_XDECREF(self->py_headers);
+    Py_XDECREF(self->py_asgi_headers);
 
     if (self->buffer) {
         PyMem_Free(self->buffer);
@@ -220,6 +222,7 @@ H1CProtocol_init(H1CProtocol *self, PyObject *args, PyObject *kwargs)
     self->py_method = NULL;
     self->py_path = NULL;
     self->py_headers = NULL;
+    self->py_asgi_headers = NULL;
     self->minor_version = 1;
     self->content_length = -1;
     self->is_chunked = 0;
@@ -413,6 +416,10 @@ H1CProtocol_feed_headers(H1CProtocol *self)
     Py_XDECREF(self->py_headers);
     self->py_headers = PyList_New(num_headers);
     if (!self->py_headers) return -1;
+
+    /* Clear cached ASGI headers */
+    Py_XDECREF(self->py_asgi_headers);
+    self->py_asgi_headers = NULL;
 
     /* Extract special headers using shared utility */
     PicoHeaderInfo hdr_info;
@@ -757,6 +764,8 @@ H1CProtocol_reset(H1CProtocol *self, PyObject *Py_UNUSED(ignored))
     self->py_path = NULL;
     Py_XDECREF(self->py_headers);
     self->py_headers = NULL;
+    Py_XDECREF(self->py_asgi_headers);
+    self->py_asgi_headers = NULL;
 
     self->minor_version = 1;
     self->content_length = -1;
@@ -808,6 +817,41 @@ H1CProtocol_get_headers(H1CProtocol *self, void *closure)
         return self->py_headers;
     }
     return PyList_New(0);
+}
+
+static PyObject *
+H1CProtocol_get_asgi_headers(H1CProtocol *self, void *closure)
+{
+    if (!self->py_headers) {
+        return PyList_New(0);
+    }
+
+    if (!self->py_asgi_headers) {
+        Py_ssize_t n = PyList_GET_SIZE(self->py_headers);
+        self->py_asgi_headers = PyList_New(n);
+        if (!self->py_asgi_headers) return NULL;
+
+        for (Py_ssize_t i = 0; i < n; i++) {
+            PyObject *tuple = PyList_GET_ITEM(self->py_headers, i);
+            PyObject *name = PyTuple_GET_ITEM(tuple, 0);
+            PyObject *value = PyTuple_GET_ITEM(tuple, 1);
+
+            const char *name_str = PyBytes_AS_STRING(name);
+            Py_ssize_t name_len = PyBytes_GET_SIZE(name);
+
+            PyObject *pair = pico_create_header_tuple_lowercase(
+                name_str, name_len,
+                PyBytes_AS_STRING(value), PyBytes_GET_SIZE(value));
+            if (!pair) {
+                Py_DECREF(self->py_asgi_headers);
+                self->py_asgi_headers = NULL;
+                return NULL;
+            }
+            PyList_SET_ITEM(self->py_asgi_headers, i, pair);
+        }
+    }
+    Py_INCREF(self->py_asgi_headers);
+    return self->py_asgi_headers;
 }
 
 static PyObject *
@@ -911,6 +955,8 @@ static PyGetSetDef H1CProtocol_getset[] = {
      "HTTP version as (major, minor) tuple", NULL},
     {"headers", (getter)H1CProtocol_get_headers, NULL,
      "List of (name, value) header tuples", NULL},
+    {"asgi_headers", (getter)H1CProtocol_get_asgi_headers, NULL,
+     "Headers with lowercase names for ASGI", NULL},
     {"content_length", (getter)H1CProtocol_get_content_length, NULL,
      "Content-Length header value, or None if not set", NULL},
     {"is_chunked", (getter)H1CProtocol_get_is_chunked, NULL,

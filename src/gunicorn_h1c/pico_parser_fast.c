@@ -63,6 +63,7 @@ typedef struct {
     PyObject *py_method;
     PyObject *py_path;
     PyObject *py_headers;
+    PyObject *py_asgi_headers;  /* Headers with lowercase names for ASGI */
 } HttpRequest;
 
 static void
@@ -71,6 +72,7 @@ HttpRequest_dealloc(HttpRequest *self)
     Py_XDECREF(self->py_method);
     Py_XDECREF(self->py_path);
     Py_XDECREF(self->py_headers);
+    Py_XDECREF(self->py_asgi_headers);
     if (self->view.buf) {
         PyBuffer_Release(&self->view);
     }
@@ -129,6 +131,29 @@ HttpRequest_get_headers(HttpRequest *self, void *closure)
     }
     Py_INCREF(self->py_headers);
     return self->py_headers;
+}
+
+static PyObject *
+HttpRequest_get_asgi_headers(HttpRequest *self, void *closure)
+{
+    if (!self->py_asgi_headers) {
+        self->py_asgi_headers = PyList_New(self->num_headers);
+        if (!self->py_asgi_headers) return NULL;
+
+        for (size_t i = 0; i < self->num_headers; i++) {
+            PyObject *pair = pico_create_header_tuple_lowercase(
+                self->headers[i].name, self->headers[i].name_len,
+                self->headers[i].value, self->headers[i].value_len);
+            if (!pair) {
+                Py_DECREF(self->py_asgi_headers);
+                self->py_asgi_headers = NULL;
+                return NULL;
+            }
+            PyList_SET_ITEM(self->py_asgi_headers, i, pair);
+        }
+    }
+    Py_INCREF(self->py_asgi_headers);
+    return self->py_asgi_headers;
 }
 
 static PyObject *
@@ -195,6 +220,7 @@ static PyGetSetDef HttpRequest_getset[] = {
     {"path", (getter)HttpRequest_get_path, NULL, "Request path", NULL},
     {"minor_version", (getter)HttpRequest_get_version, NULL, "HTTP minor version", NULL},
     {"headers", (getter)HttpRequest_get_headers, NULL, "Request headers", NULL},
+    {"asgi_headers", (getter)HttpRequest_get_asgi_headers, NULL, "Headers with lowercase names for ASGI", NULL},
     {"consumed", (getter)HttpRequest_get_consumed, NULL, "Bytes consumed", NULL},
     {"header_count", (getter)HttpRequest_get_header_count, NULL, "Number of headers", NULL},
     {"content_length", (getter)HttpRequest_get_content_length, NULL, "Content-Length (-1 if not set)", NULL},
@@ -264,6 +290,7 @@ pico_parse_request_fast(PyObject *self, PyObject *args, PyObject *kwargs)
     req->py_method = NULL;
     req->py_path = NULL;
     req->py_headers = NULL;
+    req->py_asgi_headers = NULL;
 
     /* Get buffer */
     if (PyObject_GetBuffer(data, &req->view, PyBUF_SIMPLE) < 0) {

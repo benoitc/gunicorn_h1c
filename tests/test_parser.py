@@ -155,6 +155,31 @@ class TestFastParser:
 
         assert req.header_count == 3
 
+    def test_asgi_headers_lowercase(self):
+        """asgi_headers should return headers with lowercase names."""
+        from gunicorn_h1c import parse_request_fast
+
+        data = b"GET / HTTP/1.1\r\nHost: localhost\r\nContent-Type: text/plain\r\n\r\n"
+        req = parse_request_fast(data)
+
+        # Regular headers preserve original case
+        assert req.headers[0] == (b"Host", b"localhost")
+        assert req.headers[1] == (b"Content-Type", b"text/plain")
+
+        # ASGI headers have lowercase names
+        asgi_headers = req.asgi_headers
+        assert asgi_headers[0] == (b"host", b"localhost")
+        assert asgi_headers[1] == (b"content-type", b"text/plain")
+
+    def test_asgi_headers_is_list(self):
+        """asgi_headers should return a list (not tuple) per ASGI spec."""
+        from gunicorn_h1c import parse_request_fast
+
+        data = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        req = parse_request_fast(data)
+
+        assert isinstance(req.asgi_headers, list)
+
     def test_incremental_parsing_fast(self):
         from gunicorn_h1c._parser_fast import IncompleteError
 

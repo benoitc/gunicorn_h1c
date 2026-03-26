@@ -393,6 +393,44 @@ pico_create_header_tuple(const char *name, size_t name_len,
 }
 
 /*
+ * Create (name, value) bytes tuple for header with lowercase name.
+ * Used for ASGI compliance where header names should be lowercase.
+ * Returns new reference or NULL on error.
+ */
+static inline PyObject *
+pico_create_header_tuple_lowercase(const char *name, size_t name_len,
+                                   const char *value, size_t value_len)
+{
+    char *lower_name = (char *)PyMem_Malloc(name_len);
+    if (!lower_name) {
+        PyErr_NoMemory();
+        return NULL;
+    }
+    for (size_t i = 0; i < name_len; i++) {
+        char c = name[i];
+        if (c >= 'A' && c <= 'Z') {
+            c += 32;
+        }
+        lower_name[i] = c;
+    }
+
+    PyObject *py_name = PyBytes_FromStringAndSize(lower_name, name_len);
+    PyMem_Free(lower_name);
+
+    PyObject *py_value = PyBytes_FromStringAndSize(value, value_len);
+    if (!py_name || !py_value) {
+        Py_XDECREF(py_name);
+        Py_XDECREF(py_value);
+        return NULL;
+    }
+
+    PyObject *tuple = PyTuple_Pack(2, py_name, py_value);
+    Py_DECREF(py_name);
+    Py_DECREF(py_value);
+    return tuple;
+}
+
+/*
  * Find header value by name (case-insensitive).
  * Returns new PyBytes reference or Py_None (new ref) if not found.
  * Returns NULL on error.

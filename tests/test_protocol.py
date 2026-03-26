@@ -393,6 +393,21 @@ class TestH1CProtocolProperties:
         assert p.get_header(b"content-type") == b"text/plain"
         assert p.get_header(b"X-Missing") is None
 
+    def test_asgi_headers_lowercase(self):
+        """Test asgi_headers returns headers with lowercase names."""
+        p = H1CProtocol()
+        p.feed(b"GET / HTTP/1.1\r\nHost: localhost\r\nContent-Type: text/plain\r\n\r\n")
+
+        # Regular headers preserve original case
+        assert p.headers[0] == (b"Host", b"localhost")
+        assert p.headers[1] == (b"Content-Type", b"text/plain")
+
+        # ASGI headers have lowercase names
+        asgi_headers = p.asgi_headers
+        assert asgi_headers[0] == (b"host", b"localhost")
+        assert asgi_headers[1] == (b"content-type", b"text/plain")
+        assert isinstance(asgi_headers, list)
+
     def test_content_length(self):
         """Test content_length property."""
         p = H1CProtocol()
