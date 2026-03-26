@@ -417,6 +417,12 @@ H1CProtocol_feed_headers(H1CProtocol *self)
     /* Extract special headers using shared utility */
     PicoHeaderInfo hdr_info;
     pico_extract_headers(headers, num_headers, &hdr_info);
+
+    /* Validate header framing for request smuggling prevention */
+    if (pico_validate_header_framing(&hdr_info, minor_version, InvalidHeader) < 0) {
+        return -1;
+    }
+
     self->content_length = hdr_info.content_length;
     self->is_chunked = hdr_info.has_chunked;
     self->connection_close = hdr_info.connection_close;
@@ -587,7 +593,23 @@ H1CProtocol_feed_body_chunked(H1CProtocol *self)
             char *semicolon = memchr(self->buffer, ';', line_len);
             size_t size_len = semicolon ? (size_t)(semicolon - self->buffer) : line_len;
 
-            /* Parse hex number */
+            /* Reject empty chunk size */
+            if (size_len == 0) {
+                PyErr_SetString(ParseError, "Empty chunk size");
+                return -1;
+            }
+
+            /* Reject leading/trailing whitespace (request smuggling vector) */
+            if (self->buffer[0] == ' ' || self->buffer[0] == '\t') {
+                PyErr_SetString(ParseError, "Whitespace in chunk size");
+                return -1;
+            }
+            if (size_len > 0 && (self->buffer[size_len-1] == ' ' || self->buffer[size_len-1] == '\t')) {
+                PyErr_SetString(ParseError, "Whitespace in chunk size");
+                return -1;
+            }
+
+            /* Parse hex number - strict validation, no whitespace allowed */
             size_t chunk_size = 0;
             for (size_t i = 0; i < size_len; i++) {
                 char c = self->buffer[i];
@@ -598,10 +620,9 @@ H1CProtocol_feed_body_chunked(H1CProtocol *self)
                     digit = c - 'a' + 10;
                 } else if (c >= 'A' && c <= 'F') {
                     digit = c - 'A' + 10;
-                } else if (c == ' ' || c == '\t') {
-                    continue;  /* Skip whitespace */
                 } else {
-                    PyErr_SetString(ParseError, "Invalid chunk size");
+                    /* Reject any non-hex character including whitespace */
+                    PyErr_SetString(ParseError, "Invalid character in chunk size");
                     return -1;
                 }
                 chunk_size = chunk_size * 16 + digit;

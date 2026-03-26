@@ -18,6 +18,10 @@ typedef struct {
     int has_chunked;            /* 1 if Transfer-Encoding: chunked */
     int connection_close;       /* -1=unset, 0=keep-alive, 1=close */
     int should_upgrade;         /* 1 if Upgrade header present */
+    int has_content_length;     /* 1 if Content-Length header present */
+    int chunked_count;          /* Number of "chunked" values seen */
+    int has_te_after_chunked;   /* 1 if T-E value after chunked */
+    int has_unknown_te;         /* 1 if unknown Transfer-Encoding value */
 } PicoHeaderInfo;
 
 /*
@@ -124,8 +128,137 @@ pico_contains_keepalive(const char *value, size_t value_len)
 }
 
 /*
+ * Check if a Transfer-Encoding token matches a known value.
+ * Returns: 1=chunked, 2=identity, 3=gzip/deflate/compress, 0=unknown
+ */
+static inline int
+pico_check_te_token(const char *token, size_t token_len)
+{
+    /* Skip leading/trailing whitespace */
+    while (token_len > 0 && (*token == ' ' || *token == '\t')) {
+        token++;
+        token_len--;
+    }
+    while (token_len > 0 && (token[token_len-1] == ' ' || token[token_len-1] == '\t')) {
+        token_len--;
+    }
+
+    if (token_len == 0) return 0;
+
+    /* Check for known values (case-insensitive) */
+    if (token_len == 7) {
+        /* "chunked" */
+        char buf[7];
+        for (size_t i = 0; i < 7; i++) {
+            buf[i] = token[i];
+            if (buf[i] >= 'A' && buf[i] <= 'Z') buf[i] += 32;
+        }
+        if (buf[0] == 'c' && buf[1] == 'h' && buf[2] == 'u' && buf[3] == 'n' &&
+            buf[4] == 'k' && buf[5] == 'e' && buf[6] == 'd') {
+            return 1;  /* chunked */
+        }
+    }
+    else if (token_len == 8) {
+        /* "identity" */
+        char buf[8];
+        for (size_t i = 0; i < 8; i++) {
+            buf[i] = token[i];
+            if (buf[i] >= 'A' && buf[i] <= 'Z') buf[i] += 32;
+        }
+        if (buf[0] == 'i' && buf[1] == 'd' && buf[2] == 'e' && buf[3] == 'n' &&
+            buf[4] == 't' && buf[5] == 'i' && buf[6] == 't' && buf[7] == 'y') {
+            return 2;  /* identity */
+        }
+        /* "compress" */
+        if (buf[0] == 'c' && buf[1] == 'o' && buf[2] == 'm' && buf[3] == 'p' &&
+            buf[4] == 'r' && buf[5] == 'e' && buf[6] == 's' && buf[7] == 's') {
+            return 3;  /* compress */
+        }
+    }
+    else if (token_len == 4) {
+        /* "gzip" */
+        char buf[4];
+        for (size_t i = 0; i < 4; i++) {
+            buf[i] = token[i];
+            if (buf[i] >= 'A' && buf[i] <= 'Z') buf[i] += 32;
+        }
+        if (buf[0] == 'g' && buf[1] == 'z' && buf[2] == 'i' && buf[3] == 'p') {
+            return 3;  /* gzip */
+        }
+    }
+    else if (token_len == 7) {
+        /* "deflate" */
+        char buf[7];
+        for (size_t i = 0; i < 7; i++) {
+            buf[i] = token[i];
+            if (buf[i] >= 'A' && buf[i] <= 'Z') buf[i] += 32;
+        }
+        if (buf[0] == 'd' && buf[1] == 'e' && buf[2] == 'f' && buf[3] == 'l' &&
+            buf[4] == 'a' && buf[5] == 't' && buf[6] == 'e') {
+            return 3;  /* deflate */
+        }
+    }
+
+    return 0;  /* unknown */
+}
+
+/*
+ * Parse and validate Transfer-Encoding header value.
+ * Updates info with validation flags.
+ */
+static inline void
+pico_parse_transfer_encoding(const char *value, size_t value_len, PicoHeaderInfo *info)
+{
+    const char *p = value;
+    const char *end = value + value_len;
+
+    while (p < end) {
+        /* Find end of token (comma or end) */
+        const char *token_start = p;
+        const char *token_end = p;
+
+        while (token_end < end && *token_end != ',') {
+            token_end++;
+        }
+
+        size_t token_len = token_end - token_start;
+        int te_type = pico_check_te_token(token_start, token_len);
+
+        if (te_type == 1) {
+            /* chunked */
+            if (info->has_chunked) {
+                info->chunked_count++;  /* Stacked chunked */
+            }
+            info->has_chunked = 1;
+        }
+        else if (te_type == 2 || te_type == 3) {
+            /* identity, gzip, deflate, compress */
+            if (info->has_chunked) {
+                info->has_te_after_chunked = 1;  /* T-E value after chunked */
+            }
+        }
+        else if (te_type == 0 && token_len > 0) {
+            /* Unknown transfer encoding */
+            /* Skip empty tokens */
+            const char *t = token_start;
+            size_t tlen = token_len;
+            while (tlen > 0 && (*t == ' ' || *t == '\t')) { t++; tlen--; }
+            while (tlen > 0 && (t[tlen-1] == ' ' || t[tlen-1] == '\t')) { tlen--; }
+            if (tlen > 0) {
+                info->has_unknown_te = 1;
+            }
+        }
+
+        /* Move past comma */
+        p = token_end;
+        if (p < end && *p == ',') p++;
+    }
+}
+
+/*
  * Extract special headers into PicoHeaderInfo.
  * Processes Content-Length, Transfer-Encoding, Connection, and Upgrade headers.
+ * Also performs validation for request smuggling prevention.
  */
 static inline void
 pico_extract_headers(struct phr_header *headers, size_t num_headers,
@@ -135,6 +268,10 @@ pico_extract_headers(struct phr_header *headers, size_t num_headers,
     info->has_chunked = 0;
     info->connection_close = -1;
     info->should_upgrade = 0;
+    info->has_content_length = 0;
+    info->chunked_count = 0;
+    info->has_te_after_chunked = 0;
+    info->has_unknown_te = 0;
 
     for (size_t i = 0; i < num_headers; i++) {
         const char *name = headers[i].name;
@@ -143,12 +280,18 @@ pico_extract_headers(struct phr_header *headers, size_t num_headers,
         size_t value_len = headers[i].value_len;
 
         if (pico_header_name_eq(name, name_len, "content-length", 14)) {
-            info->content_length = pico_parse_content_length(value, value_len);
+            /* Track if we already saw Content-Length (duplicate detection) */
+            if (info->has_content_length) {
+                /* Second Content-Length - mark for rejection */
+                info->content_length = -2;  /* Special value for duplicate */
+            } else {
+                info->content_length = pico_parse_content_length(value, value_len);
+                info->has_content_length = 1;
+            }
         }
         else if (pico_header_name_eq(name, name_len, "transfer-encoding", 17)) {
-            if (pico_contains_chunked(value, value_len)) {
-                info->has_chunked = 1;
-            }
+            /* Parse and validate Transfer-Encoding value */
+            pico_parse_transfer_encoding(value, value_len, info);
         }
         else if (pico_header_name_eq(name, name_len, "connection", 10)) {
             if (pico_contains_close(value, value_len)) {
@@ -161,6 +304,70 @@ pico_extract_headers(struct phr_header *headers, size_t num_headers,
             info->should_upgrade = 1;
         }
     }
+}
+
+/*
+ * Validate headers for request smuggling prevention.
+ * Returns 0 on success, -1 on error (sets Python exception).
+ *
+ * Checks:
+ * - Duplicate Content-Length headers
+ * - Content-Length with Transfer-Encoding (CL+TE conflict)
+ * - Chunked encoding in HTTP/1.0
+ * - Stacked chunked encoding
+ * - Unknown Transfer-Encoding values
+ * - Transfer-Encoding values after chunked
+ */
+static inline int
+pico_validate_header_framing(PicoHeaderInfo *info, int minor_version,
+                              PyObject *InvalidHeader)
+{
+    /* Check for duplicate Content-Length */
+    if (info->content_length == -2) {
+        PyErr_SetString(InvalidHeader, "Duplicate Content-Length header");
+        return -1;
+    }
+
+    /* Check for negative Content-Length (invalid) */
+    if (info->has_content_length && info->content_length < 0) {
+        PyErr_SetString(InvalidHeader, "Invalid Content-Length value");
+        return -1;
+    }
+
+    /* Check for unknown Transfer-Encoding */
+    if (info->has_unknown_te) {
+        PyErr_SetString(InvalidHeader, "Unsupported Transfer-Encoding");
+        return -1;
+    }
+
+    /* Check for stacked chunked encoding */
+    if (info->chunked_count > 0) {
+        PyErr_SetString(InvalidHeader, "Stacked chunked encoding");
+        return -1;
+    }
+
+    /* Check for Transfer-Encoding value after chunked */
+    if (info->has_te_after_chunked) {
+        PyErr_SetString(InvalidHeader, "Invalid Transfer-Encoding after chunked");
+        return -1;
+    }
+
+    /* If chunked encoding is present */
+    if (info->has_chunked) {
+        /* Reject chunked in HTTP/1.0 (RFC 9112 Section 6.1) */
+        if (minor_version == 0) {
+            PyErr_SetString(InvalidHeader, "Chunked encoding not allowed in HTTP/1.0");
+            return -1;
+        }
+
+        /* Reject Content-Length with Transfer-Encoding (request smuggling vector) */
+        if (info->has_content_length) {
+            PyErr_SetString(InvalidHeader, "Content-Length with Transfer-Encoding");
+            return -1;
+        }
+    }
+
+    return 0;
 }
 
 /*
