@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.0] - 2026-03-26
+
+### Added
+
+- Header framing validation to prevent ambiguous requests
+  - Reject duplicate Content-Length headers
+  - Reject Content-Length with Transfer-Encoding (CL+TE conflict)
+  - Reject chunked encoding in HTTP/1.0
+  - Reject stacked chunked encoding
+  - Reject unknown Transfer-Encoding values
+- Strict chunk size parsing (reject whitespace, empty sizes)
+- `pico_validate_headers_full()` function for complete header validation
+- 30 new tests for header validation
+
+### Changed
+
+- All parsers (parse_request, parse_request_fast, H1CProtocol) now perform framing validation
+
 ## [0.5.1] - 2026-03-22
 
 ### Fixed
