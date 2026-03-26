@@ -2,10 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.1] - 2026-03-26
+
+### Added
+
+- GitHub Actions CI workflow (Python 3.13/3.14 on Linux and macOS)
+- Ruff configuration for linting and formatting
+
 ## [0.6.0] - 2026-03-26
 
 ### Added
 
+- `finish()` method on H1CProtocol for EOF handling in chunked encoding
 - Header framing validation to prevent ambiguous requests
   - Reject duplicate Content-Length headers
   - Reject Content-Length with Transfer-Encoding (CL+TE conflict)
