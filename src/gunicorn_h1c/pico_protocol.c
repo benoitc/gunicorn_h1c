@@ -722,6 +722,26 @@ H1CProtocol_feed_body_chunked(H1CProtocol *self)
 }
 
 /*
+ * Mark parsing complete for EOF handling.
+ * Call when no more data will be received. Handles edge cases like
+ * chunked encoding without final trailer CRLF.
+ */
+static PyObject *
+H1CProtocol_finish(H1CProtocol *self, PyObject *Py_UNUSED(ignored))
+{
+    if (self->state == STATE_BODY_CHUNKED_TRAILER) {
+        /* All body data received, just missing final CRLF */
+        self->state = STATE_COMPLETE;
+        if (self->on_message_complete) {
+            PyObject *result = PyObject_CallNoArgs(self->on_message_complete);
+            if (!result) return NULL;
+            Py_DECREF(result);
+        }
+    }
+    Py_RETURN_NONE;
+}
+
+/*
  * Reset the parser for the next request (keepalive).
  */
 static PyObject *
@@ -907,6 +927,8 @@ static PyGetSetDef H1CProtocol_getset[] = {
 static PyMethodDef H1CProtocol_methods[] = {
     {"feed", (PyCFunction)H1CProtocol_feed, METH_VARARGS,
      "Feed data to the parser. Callbacks fire synchronously."},
+    {"finish", (PyCFunction)H1CProtocol_finish, METH_NOARGS,
+     "Mark parsing complete for EOF handling."},
     {"reset", (PyCFunction)H1CProtocol_reset, METH_NOARGS,
      "Reset the parser for the next request (keepalive)."},
     {"get_header", (PyCFunction)H1CProtocol_get_header, METH_VARARGS,

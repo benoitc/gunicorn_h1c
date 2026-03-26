@@ -300,6 +300,69 @@ class TestH1CProtocolReset:
         assert methods == [b"GET", b"POST", b"DELETE"]
 
 
+class TestH1CProtocolFinish:
+    """Test finish() for EOF handling."""
+
+    def test_finish_chunked_in_trailer_state(self):
+        """Test finish() completes request when in chunked trailer state."""
+        chunks = []
+        complete = False
+
+        def on_body(chunk):
+            chunks.append(chunk)
+
+        def on_complete():
+            nonlocal complete
+            complete = True
+
+        p = H1CProtocol(
+            on_body=on_body,
+            on_message_complete=on_complete,
+        )
+        # Send chunked request without final CRLF after zero-chunk
+        p.feed(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n")
+        p.feed(b"5\r\nHello\r\n")
+        p.feed(b"0\r\n")  # Zero chunk but no final CRLF
+
+        assert not complete  # Not complete yet - waiting for final CRLF
+        assert not p.is_complete
+
+        p.finish()  # Signal EOF
+
+        assert complete
+        assert p.is_complete
+        assert chunks == [b"Hello"]
+
+    def test_finish_no_effect_when_complete(self):
+        """Test finish() is no-op when already complete."""
+        complete_count = 0
+
+        def on_complete():
+            nonlocal complete_count
+            complete_count += 1
+
+        p = H1CProtocol(on_message_complete=on_complete)
+        p.feed(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+
+        assert complete_count == 1
+        assert p.is_complete
+
+        p.finish()  # Should be no-op
+
+        assert complete_count == 1  # Not called again
+
+    def test_finish_no_effect_during_headers(self):
+        """Test finish() is no-op during header parsing."""
+        p = H1CProtocol()
+        p.feed(b"GET / HTTP/1.1\r\n")  # Incomplete headers
+
+        assert not p.is_complete
+
+        p.finish()
+
+        assert not p.is_complete  # Still incomplete
+
+
 class TestH1CProtocolProperties:
     """Test property accessors."""
 
