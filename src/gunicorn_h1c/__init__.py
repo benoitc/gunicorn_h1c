@@ -25,7 +25,7 @@ Usage:
     print(req.has_chunked)    # False
 """
 
-__version__ = "0.5.1"
+__version__ = "0.6.3"
 __all__ = [
     # Basic parser
     "parse_request",
@@ -49,12 +49,14 @@ __all__ = [
     "InvalidHTTPVersion",
     "InvalidHeaderName",
     "InvalidHeader",
+    "InvalidChunkExtension",
 ]
 
 # Import from C extensions
 try:
     from gunicorn_h1c._parser import (
         IncompleteError,
+        InvalidChunkExtension,
         InvalidHeader,
         InvalidHeaderName,
         InvalidHTTPVersion,

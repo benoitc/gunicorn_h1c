@@ -3,7 +3,7 @@
 import pytest
 from gunicorn_h1c._protocol import ParseError
 
-from gunicorn_h1c import H1CProtocol
+from gunicorn_h1c import H1CProtocol, InvalidChunkExtension
 
 
 class TestH1CProtocolBasic:
@@ -526,3 +526,75 @@ class TestH1CProtocolQueryString:
         p.feed(b"GET /api?key=value HTTP/1.1\r\nHost: localhost\r\n\r\n")
 
         assert url_received == b"/api?key=value"
+
+
+class TestH1CProtocolChunkExtensionValidation:
+    """Test chunk extension validation per RFC 9112."""
+
+    def test_bare_cr_in_chunk_extension_rejected(self):
+        """Test chunk extension with bare CR is rejected."""
+        p = H1CProtocol()
+        p.feed(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n")
+
+        with pytest.raises(InvalidChunkExtension) as exc_info:
+            p.feed(b"1;\r\r\na\r\n0\r\n\r\n")
+
+        assert "bare CR" in str(exc_info.value)
+
+    def test_bare_cr_in_chunk_extension_value_rejected(self):
+        """Test chunk extension value with bare CR is rejected."""
+        p = H1CProtocol()
+        p.feed(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n")
+
+        with pytest.raises(InvalidChunkExtension) as exc_info:
+            p.feed(b"1;ext=val\rue\r\na\r\n0\r\n\r\n")
+
+        assert "bare CR" in str(exc_info.value)
+
+    def test_valid_chunk_extension_accepted(self):
+        """Test valid chunk extension is accepted."""
+        chunks = []
+
+        p = H1CProtocol(on_body=lambda c: chunks.append(c))
+        p.feed(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n")
+        p.feed(b"5;ext=value\r\nHello\r\n0\r\n\r\n")
+
+        assert chunks == [b"Hello"]
+        assert p.is_complete
+
+    def test_multiple_chunk_extensions_accepted(self):
+        """Test multiple chunk extensions are accepted."""
+        chunks = []
+
+        p = H1CProtocol(on_body=lambda c: chunks.append(c))
+        p.feed(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n")
+        p.feed(b"5;ext1=a;ext2=b\r\nHello\r\n0\r\n\r\n")
+
+        assert chunks == [b"Hello"]
+        assert p.is_complete
+
+    def test_chunk_without_extension_accepted(self):
+        """Test chunk without extension works normally."""
+        chunks = []
+
+        p = H1CProtocol(on_body=lambda c: chunks.append(c))
+        p.feed(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n")
+        p.feed(b"5\r\nHello\r\n0\r\n\r\n")
+
+        assert chunks == [b"Hello"]
+        assert p.is_complete
+
+    def test_invalid_chunk_extension_is_parse_error(self):
+        """Test InvalidChunkExtension inherits from ParseError."""
+        assert issubclass(InvalidChunkExtension, Exception)
+        # It should inherit from ParseError (which inherits from ValueError)
+        p = H1CProtocol()
+        p.feed(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n")
+
+        try:
+            p.feed(b"1;\r\r\na\r\n0\r\n\r\n")
+            assert False, "Should have raised InvalidChunkExtension"
+        except InvalidChunkExtension:
+            pass  # Expected
+        except Exception as e:
+            assert False, f"Wrong exception type: {type(e).__name__}"

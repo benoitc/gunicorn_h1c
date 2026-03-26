@@ -36,6 +36,7 @@ static PyObject *InvalidRequestMethod;
 static PyObject *InvalidHTTPVersion;
 static PyObject *InvalidHeaderName;
 static PyObject *InvalidHeader;
+static PyObject *InvalidChunkExtension;
 
 /*
  * H1CProtocol type
@@ -600,6 +601,16 @@ H1CProtocol_feed_body_chunked(H1CProtocol *self)
             char *semicolon = memchr(self->buffer, ';', line_len);
             size_t size_len = semicolon ? (size_t)(semicolon - self->buffer) : line_len;
 
+            /* RFC 9112: chunk-ext must not contain bare CR */
+            if (semicolon) {
+                size_t ext_len = line_len - size_len - 1;
+                if (memchr(semicolon + 1, '\r', ext_len)) {
+                    PyErr_SetString(InvalidChunkExtension,
+                        "Invalid chunk extension: bare CR not allowed");
+                    return -1;
+                }
+            }
+
             /* Reject empty chunk size */
             if (size_len == 0) {
                 PyErr_SetString(ParseError, "Empty chunk size");
@@ -1051,6 +1062,9 @@ PyInit__protocol(void)
 
     InvalidHeader = PyObject_GetAttrString(parser_module, "InvalidHeader");
     if (!InvalidHeader) { Py_DECREF(parser_module); return NULL; }
+
+    InvalidChunkExtension = PyObject_GetAttrString(parser_module, "InvalidChunkExtension");
+    if (!InvalidChunkExtension) { Py_DECREF(parser_module); return NULL; }
 
     Py_DECREF(parser_module);
 

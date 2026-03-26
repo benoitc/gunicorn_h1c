@@ -24,6 +24,7 @@ static PyObject *InvalidRequestMethod;
 static PyObject *InvalidHTTPVersion;
 static PyObject *InvalidHeaderName;
 static PyObject *InvalidHeader;
+static PyObject *InvalidChunkExtension;
 
 /*
  * parse_request(data: bytes, last_len: int = 0, ...) -> dict
@@ -1064,6 +1065,11 @@ PyInit__parser(void)
     if (!InvalidHeader) return NULL;
     Py_INCREF(InvalidHeader);
     PyModule_AddObject(m, "InvalidHeader", InvalidHeader);
+
+    InvalidChunkExtension = PyErr_NewException("gunicorn_h1c._parser.InvalidChunkExtension", PicoError, NULL);
+    if (!InvalidChunkExtension) return NULL;
+    Py_INCREF(InvalidChunkExtension);
+    PyModule_AddObject(m, "InvalidChunkExtension", InvalidChunkExtension);
 
     return m;
 }
