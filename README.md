@@ -409,6 +409,7 @@ Returns dict with `type`, `asgi`, `http_version`, `method`, `scheme`, `path`, `r
 - `InvalidHTTPVersion`: HTTP version not 1.0 or 1.1 (e.g., HTTP/2.0, HTTP/0.9)
 - `InvalidHeaderName`: Invalid header name characters (not RFC 9110 token, e.g., space)
 - `InvalidHeader`: Invalid header value (contains NUL, CR, or LF)
+- `InvalidChunkExtension`: Chunk extension contains bare CR (RFC 9112 violation)
 
 When parsing fails, the parser analyzes the buffer to raise the most specific exception possible, helping identify the exact cause of malformed requests.
 

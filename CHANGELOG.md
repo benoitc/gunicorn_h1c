@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.3] - 2026-03-26
+
+### Added
+
+- `InvalidChunkExtension` exception for chunk extension validation errors
+- Validation to reject chunk extensions containing bare CR bytes (RFC 9112 compliance)
+
+### Security
+
+- Prevents potential request smuggling via malformed chunk extensions
+
 ## [0.6.2] - 2026-03-26
 
 ### Added
