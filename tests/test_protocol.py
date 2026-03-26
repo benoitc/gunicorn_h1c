@@ -593,8 +593,8 @@ class TestH1CProtocolChunkExtensionValidation:
 
         try:
             p.feed(b"1;\r\r\na\r\n0\r\n\r\n")
-            assert False, "Should have raised InvalidChunkExtension"
+            pytest.fail("Should have raised InvalidChunkExtension")
         except InvalidChunkExtension:
             pass  # Expected
         except Exception as e:
-            assert False, f"Wrong exception type: {type(e).__name__}"
+            pytest.fail(f"Wrong exception type: {type(e).__name__}")
