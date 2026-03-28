@@ -1,9 +1,15 @@
 """Tests for H1CProtocol callback-based parser."""
 
 import pytest
-from gunicorn_h1c._protocol import ParseError
+from gunicorn_h1c._protocol import ParseError as ProtocolParseError
 
-from gunicorn_h1c import H1CProtocol, InvalidChunkExtension
+from gunicorn_h1c import (
+    H1CProtocol,
+    InvalidChunkExtension,
+    LimitRequestLine,
+    LimitRequestHeaders,
+    ParseError,  # From _parser module
+)
 
 
 class TestH1CProtocolBasic:
@@ -437,7 +443,7 @@ class TestH1CProtocolErrors:
         """Test invalid HTTP request raises ParseError."""
         p = H1CProtocol()
 
-        with pytest.raises(ParseError):
+        with pytest.raises(ProtocolParseError):
             p.feed(b"INVALID\r\n\r\n")
 
     def test_invalid_chunk_size(self):
@@ -445,14 +451,14 @@ class TestH1CProtocolErrors:
         p = H1CProtocol()
         p.feed(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n")
 
-        with pytest.raises(ParseError):
+        with pytest.raises(ProtocolParseError):
             p.feed(b"ZZZZ\r\n")  # Invalid hex
 
     def test_parse_error_has_status_code(self):
         """Test ParseError has status_code attribute."""
         p = H1CProtocol()
 
-        with pytest.raises(ParseError):
+        with pytest.raises(ProtocolParseError):
             p.feed(b"INVALID\r\n\r\n")
 
 
@@ -598,3 +604,76 @@ class TestH1CProtocolChunkExtensionValidation:
             pass  # Expected
         except Exception as e:
             pytest.fail(f"Wrong exception type: {type(e).__name__}")
+
+
+class TestH1CProtocolLimitValidation:
+    """Test request limit validation."""
+
+    def test_limit_request_line_exceeded(self):
+        """Test LimitRequestLine raised when request line is too long."""
+        p = H1CProtocol(limit_request_line=20)
+
+        with pytest.raises(LimitRequestLine):
+            # Request line "GET /very/long/path HTTP/1.1" exceeds 20 bytes
+            p.feed(b"GET /very/long/path HTTP/1.1\r\nHost: localhost\r\n\r\n")
+
+    def test_limit_request_line_at_boundary(self):
+        """Test request line at exactly the limit is accepted."""
+        # "GET / HTTP/1.1" is 14 bytes
+        p = H1CProtocol(limit_request_line=14)
+        p.feed(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+
+        assert p.is_complete
+        assert p.method == b"GET"
+
+    def test_limit_request_fields_exceeded(self):
+        """Test LimitRequestHeaders raised when too many headers."""
+        p = H1CProtocol(limit_request_fields=2)
+
+        with pytest.raises(LimitRequestHeaders):
+            p.feed(
+                b"GET / HTTP/1.1\r\n"
+                b"Host: localhost\r\n"
+                b"Accept: */*\r\n"
+                b"User-Agent: test\r\n"  # 3rd header exceeds limit of 2
+                b"\r\n"
+            )
+
+    def test_limit_request_fields_at_boundary(self):
+        """Test number of headers at exactly the limit is accepted."""
+        p = H1CProtocol(limit_request_fields=2)
+        p.feed(
+            b"GET / HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Accept: */*\r\n"
+            b"\r\n"
+        )
+
+        assert p.is_complete
+        assert len(p.headers) == 2
+
+    def test_limit_request_field_size_exceeded(self):
+        """Test LimitRequestHeaders raised when header value is too large."""
+        p = H1CProtocol(limit_request_field_size=20)
+
+        with pytest.raises(LimitRequestHeaders):
+            p.feed(
+                b"GET / HTTP/1.1\r\n"
+                b"Host: this-is-a-very-long-hostname.example.com\r\n"
+                b"\r\n"
+            )
+
+    def test_limit_request_field_size_at_boundary(self):
+        """Test header field at exactly the limit is accepted."""
+        # "Host" (4) + ": " (2) + "localhost" (9) = 15, plus name "Host" = 4
+        # Total header line without name: ": localhost" = 11
+        p = H1CProtocol(limit_request_field_size=20)
+        p.feed(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+
+        assert p.is_complete
+
+    def test_limit_exceptions_inherit_from_parse_error(self):
+        """Test limit exceptions inherit from ParseError for proper handling."""
+        # This ensures gunicorn can catch these with a single ParseError handler
+        assert issubclass(LimitRequestLine, ParseError)
+        assert issubclass(LimitRequestHeaders, ParseError)
