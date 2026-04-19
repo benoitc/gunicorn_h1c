@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.4] - 2026-04-19
+
+### Fixed
+
+- Reject forbidden trailer field-names per RFC 9110 section 6.5.1
+- Enforce request-target form and method pairing per RFC 9112
+- Reject control characters in header field-value per RFC 9110 section 5.5
+
+### Changed
+
+- Add H1CProtocol limit validation tests
+- Replace `assert False` with `pytest.fail()` to fix B011 lint error
+- Ruff format `tests/test_protocol.py`
+
 ## [0.6.3] - 2026-03-26
 
 ### Added
