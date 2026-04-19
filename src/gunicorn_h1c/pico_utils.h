@@ -563,6 +563,67 @@ pico_validate_method(const char *method, size_t method_len,
 }
 
 /*
+ * Validate request-target form against method (RFC 9112 sections 3.2.3 and 3.2.4).
+ * Returns 0 on success, -1 on error (sets Python exception).
+ *
+ * Enforces:
+ *  - asterisk-form ("*") requires OPTIONS.
+ *  - authority-form (host:port with no scheme, no leading "/") requires CONNECT.
+ *  - relative-reference is rejected (falls out of authority-form check).
+ */
+static inline int
+pico_validate_request_target(const char *method, size_t method_len,
+                             const char *path, size_t path_len,
+                             PyObject *ParseError)
+{
+    if (path_len == 0) {
+        PyErr_SetString(ParseError, "Empty request-target");
+        return -1;
+    }
+
+    int is_connect = (method_len == 7 &&
+                      method[0] == 'C' && method[1] == 'O' && method[2] == 'N' &&
+                      method[3] == 'N' && method[4] == 'E' && method[5] == 'C' &&
+                      method[6] == 'T');
+    int is_options = (method_len == 7 &&
+                      method[0] == 'O' && method[1] == 'P' && method[2] == 'T' &&
+                      method[3] == 'I' && method[4] == 'O' && method[5] == 'N' &&
+                      method[6] == 'S');
+
+    /* asterisk-form */
+    if (path_len == 1 && path[0] == '*') {
+        if (!is_options) {
+            PyErr_SetString(ParseError,
+                "asterisk-form request-target requires OPTIONS method");
+            return -1;
+        }
+        return 0;
+    }
+
+    /* origin-form */
+    if (path[0] == '/') {
+        return 0;
+    }
+
+    /* absolute-form: contains "://" */
+    for (size_t i = 0; i + 2 < path_len; i++) {
+        if (path[i] == ':' && path[i + 1] == '/' && path[i + 2] == '/') {
+            return 0;
+        }
+    }
+
+    /* Remaining shape is authority-form or a relative reference; both
+     * are only legal in a CONNECT request. */
+    if (!is_connect) {
+        PyErr_SetString(ParseError,
+            "authority-form or relative request-target requires CONNECT method");
+        return -1;
+    }
+
+    return 0;
+}
+
+/*
  * Validate HTTP version.
  * Returns 0 on success, -1 on error (sets Python exception).
  *

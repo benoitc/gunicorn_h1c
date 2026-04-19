@@ -351,6 +351,14 @@ pico_parse_request_fast(PyObject *self, PyObject *args, PyObject *kwargs)
         return NULL;
     }
 
+    /* Validate request-target form against method (RFC 9112) */
+    if (pico_validate_request_target(req->method, req->method_len,
+                                      req->path, req->path_len,
+                                      ParseError) < 0) {
+        Py_DECREF(req);
+        return NULL;
+    }
+
     /* Validate HTTP version */
     if (pico_validate_version(req->minor_version,
                                permit_unconventional_http_version,
