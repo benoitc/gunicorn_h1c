@@ -12,10 +12,20 @@ from gunicorn_h1c._protocol import ParseError as ProtocolParseError
 from gunicorn_h1c import (
     H1CProtocol,
     InvalidHeader,
+    InvalidHeaderName,
     ParseError,
     parse_request,
     parse_request_fast,
 )
+
+FORBIDDEN_TRAILERS = [
+    b"Host",
+    b"Content-Length",
+    b"Transfer-Encoding",
+    b"Trailer",
+    b"Authorization",
+    b"TE",
+]
 
 CONTROL_BYTE_IDS = ["BEL-0x07", "FF-0x0c", "VT-0x0b", "DEL-0x7f"]
 CONTROL_BYTES = [b"\x07", b"\x0c", b"\x0b", b"\x7f"]
@@ -112,3 +122,27 @@ class TestRequestTargetFormMethodPairing:
         result = parse_request(data)
         assert result["method"] == b"CONNECT"
         assert result["path"] == b"example.com:443"
+
+
+class TestForbiddenTrailerFields:
+    """RFC 9110 section 6.5.1: certain headers must not appear in trailers."""
+
+    @pytest.mark.parametrize("name", FORBIDDEN_TRAILERS)
+    def test_protocol_rejects(self, name):
+        data = (
+            b"POST /p HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
+            b"5\r\nhello\r\n"
+            b"0\r\n" + name + b": evil\r\n\r\n"
+        )
+        p = H1CProtocol()
+        with pytest.raises(InvalidHeaderName):
+            p.feed(data)
+
+    def test_protocol_accepts_benign_trailer(self):
+        data = (
+            b"POST /p HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
+            b"5\r\nhello\r\n"
+            b"0\r\nX-Trace-Id: 123\r\n\r\n"
+        )
+        p = H1CProtocol()
+        p.feed(data)  # no exception
