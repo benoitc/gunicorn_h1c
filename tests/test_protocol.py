@@ -6,8 +6,8 @@ from gunicorn_h1c._protocol import ParseError as ProtocolParseError
 from gunicorn_h1c import (
     H1CProtocol,
     InvalidChunkExtension,
-    LimitRequestLine,
     LimitRequestHeaders,
+    LimitRequestLine,
     ParseError,  # From _parser module
 )
 
@@ -642,12 +642,7 @@ class TestH1CProtocolLimitValidation:
     def test_limit_request_fields_at_boundary(self):
         """Test number of headers at exactly the limit is accepted."""
         p = H1CProtocol(limit_request_fields=2)
-        p.feed(
-            b"GET / HTTP/1.1\r\n"
-            b"Host: localhost\r\n"
-            b"Accept: */*\r\n"
-            b"\r\n"
-        )
+        p.feed(b"GET / HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\n\r\n")
 
         assert p.is_complete
         assert len(p.headers) == 2
