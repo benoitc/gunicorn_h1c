@@ -732,6 +732,25 @@ H1CProtocol_feed_body_chunked(H1CProtocol *self)
                 return 0;
             }
 
+            /* RFC 9110 section 6.5.1: forbid routing/framing/auth fields
+             * in a trailer. Find the colon that ends the field-name. */
+            char *colon = memchr(self->buffer, ':', line_len);
+            if (colon) {
+                char *name_start = self->buffer;
+                size_t name_len = (size_t)(colon - name_start);
+                while (name_len > 0 &&
+                       (name_start[name_len - 1] == ' ' ||
+                        name_start[name_len - 1] == '\t')) {
+                    name_len--;
+                }
+                if (pico_is_forbidden_trailer_name(name_start, name_len)) {
+                    PyErr_Format(InvalidHeaderName,
+                        "Header field not allowed in trailer: %.*s",
+                        (int)name_len, name_start);
+                    return -1;
+                }
+            }
+
             /* Skip trailer line */
             size_t consumed = line_len + 2;
             memmove(self->buffer, self->buffer + consumed, self->buffer_len - consumed);
