@@ -608,7 +608,8 @@ pico_validate_header_name(const char *name, size_t name_len,
  * Validate header value.
  * Returns 0 on success, -1 on error (sets Python exception).
  *
- * No NUL, CR, LF characters allowed.
+ * RFC 9110 section 5.5: field-vchar = VCHAR / obs-text; plus SP / HTAB.
+ * Any other control byte (0x00-0x08, 0x0A-0x1F, 0x7F) is invalid.
  */
 static inline int
 pico_validate_header_value(const char *value, size_t value_len,
@@ -616,19 +617,9 @@ pico_validate_header_value(const char *value, size_t value_len,
 {
     for (size_t i = 0; i < value_len; i++) {
         unsigned char c = (unsigned char)value[i];
-        if (c == '\0') {
-            PyErr_SetString(InvalidHeader,
-                "NUL character not allowed in header value");
-            return -1;
-        }
-        if (c == '\r') {
-            PyErr_SetString(InvalidHeader,
-                "CR character not allowed in header value");
-            return -1;
-        }
-        if (c == '\n') {
-            PyErr_SetString(InvalidHeader,
-                "LF character not allowed in header value");
+        if (c <= 0x08 || (c >= 0x0A && c <= 0x1F) || c == 0x7F) {
+            PyErr_Format(InvalidHeader,
+                "Invalid control character '\\x%02x' in header value", c);
             return -1;
         }
     }
@@ -803,28 +794,18 @@ pico_analyze_parse_error(const char *buf, size_t buf_len,
                 }
             }
 
-            /* Validate header value (look for NUL, CR, LF) */
+            /* Validate header value: RFC 9110 section 5.5 field-vchar. */
             if (colon && colon + 1 < line_end) {
                 const char *value_start = colon + 1;
-                /* Skip leading whitespace */
                 while (value_start < line_end &&
                        (*value_start == ' ' || *value_start == '\t')) {
                     value_start++;
                 }
                 for (const char *q = value_start; q < line_end; q++) {
-                    if (*q == '\0') {
-                        PyErr_SetString(InvalidHeader,
-                            "NUL character not allowed in header value");
-                        return -1;
-                    }
-                    if (*q == '\n') {
-                        PyErr_SetString(InvalidHeader,
-                            "LF character not allowed in header value");
-                        return -1;
-                    }
-                    if (*q == '\r') {
-                        PyErr_SetString(InvalidHeader,
-                            "CR character not allowed in header value");
+                    unsigned char c = (unsigned char)*q;
+                    if (c <= 0x08 || (c >= 0x0A && c <= 0x1F) || c == 0x7F) {
+                        PyErr_Format(InvalidHeader,
+                            "Invalid control character '\\x%02x' in header value", c);
                         return -1;
                     }
                 }
