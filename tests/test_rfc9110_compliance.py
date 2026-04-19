@@ -146,3 +146,36 @@ class TestForbiddenTrailerFields:
         )
         p = H1CProtocol()
         p.feed(data)  # no exception
+
+
+class TestContentLengthListForm:
+    """RFC 9112 section 6.3: reject list-form Content-Length (smuggling risk)."""
+
+    def test_basic_parser_rejects(self):
+        data = (
+            b"POST /p HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5, 5\r\n\r\nhello"
+        )
+        with pytest.raises(InvalidHeader):
+            parse_request(data)
+
+    def test_fast_parser_rejects(self):
+        data = (
+            b"POST /p HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5, 5\r\n\r\nhello"
+        )
+        with pytest.raises(InvalidHeader):
+            parse_request_fast(data)
+
+    def test_protocol_rejects(self):
+        data = (
+            b"POST /p HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5, 5\r\n\r\nhello"
+        )
+        p = H1CProtocol()
+        with pytest.raises(InvalidHeader):
+            p.feed(data)
+
+    def test_basic_parser_rejects_mismatch(self):
+        data = (
+            b"POST /p HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5, 6\r\n\r\nhello"
+        )
+        with pytest.raises(InvalidHeader):
+            parse_request(data)
