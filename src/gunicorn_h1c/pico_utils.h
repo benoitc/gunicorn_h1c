@@ -563,6 +563,38 @@ pico_validate_method(const char *method, size_t method_len,
 }
 
 /*
+ * Case-insensitive equality check against a lowercase ASCII literal.
+ */
+static inline int
+pico_name_ieq(const char *name, size_t name_len,
+              const char *lower, size_t lower_len)
+{
+    if (name_len != lower_len) return 0;
+    for (size_t i = 0; i < name_len; i++) {
+        char c = name[i];
+        if (c >= 'A' && c <= 'Z') c += 32;
+        if (c != lower[i]) return 0;
+    }
+    return 1;
+}
+
+/*
+ * RFC 9110 section 6.5.1: reject header fields that must not appear in a
+ * trailer section because they alter routing, framing, or authentication.
+ * Returns 1 if name is forbidden, 0 otherwise.
+ */
+static inline int
+pico_is_forbidden_trailer_name(const char *name, size_t name_len)
+{
+    return pico_name_ieq(name, name_len, "host", 4)
+        || pico_name_ieq(name, name_len, "content-length", 14)
+        || pico_name_ieq(name, name_len, "transfer-encoding", 17)
+        || pico_name_ieq(name, name_len, "trailer", 7)
+        || pico_name_ieq(name, name_len, "authorization", 13)
+        || pico_name_ieq(name, name_len, "te", 2);
+}
+
+/*
  * Validate request-target form against method (RFC 9112 sections 3.2.3 and 3.2.4).
  * Returns 0 on success, -1 on error (sets Python exception).
  *
