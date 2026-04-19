@@ -370,6 +370,12 @@ H1CProtocol_feed_headers(H1CProtocol *self)
         return -1;
     }
 
+    /* Validate request-target form against method (RFC 9112) */
+    if (pico_validate_request_target(method, method_len, path, path_len,
+                                      ParseError) < 0) {
+        return -1;
+    }
+
     /* Validate HTTP version */
     if (pico_validate_version(minor_version,
                                self->permit_unconventional_http_version,

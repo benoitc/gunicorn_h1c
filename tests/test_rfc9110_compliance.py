@@ -6,10 +6,13 @@ that enforces them (TDD workflow).
 """
 
 import pytest
+from gunicorn_h1c._parser_fast import ParseError as FastParseError
+from gunicorn_h1c._protocol import ParseError as ProtocolParseError
 
 from gunicorn_h1c import (
     H1CProtocol,
     InvalidHeader,
+    ParseError,
     parse_request,
     parse_request_fast,
 )
@@ -45,3 +48,67 @@ class TestFieldValueControlChars:
         p = H1CProtocol()
         with pytest.raises(InvalidHeader):
             p.feed(data)
+
+
+class TestRequestTargetFormMethodPairing:
+    """RFC 9112 sections 3.2.3 & 3.2.4: form must match the method."""
+
+    def test_basic_parser_rejects_asterisk_with_get(self):
+        data = b"GET * HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        with pytest.raises(ParseError):
+            parse_request(data)
+
+    def test_fast_parser_rejects_asterisk_with_get(self):
+        data = b"GET * HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        with pytest.raises(FastParseError):
+            parse_request_fast(data)
+
+    def test_protocol_rejects_asterisk_with_get(self):
+        data = b"GET * HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        p = H1CProtocol()
+        with pytest.raises(ProtocolParseError):
+            p.feed(data)
+
+    def test_basic_parser_rejects_authority_with_get(self):
+        data = b"GET example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
+        with pytest.raises(ParseError):
+            parse_request(data)
+
+    def test_fast_parser_rejects_authority_with_get(self):
+        data = b"GET example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
+        with pytest.raises(FastParseError):
+            parse_request_fast(data)
+
+    def test_protocol_rejects_authority_with_get(self):
+        data = b"GET example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
+        p = H1CProtocol()
+        with pytest.raises(ProtocolParseError):
+            p.feed(data)
+
+    def test_basic_parser_rejects_relative_target(self):
+        data = b"GET foo/bar HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        with pytest.raises(ParseError):
+            parse_request(data)
+
+    def test_fast_parser_rejects_relative_target(self):
+        data = b"GET foo/bar HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        with pytest.raises(FastParseError):
+            parse_request_fast(data)
+
+    def test_protocol_rejects_relative_target(self):
+        data = b"GET foo/bar HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        p = H1CProtocol()
+        with pytest.raises(ProtocolParseError):
+            p.feed(data)
+
+    def test_options_asterisk_still_valid(self):
+        data = b"OPTIONS * HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        result = parse_request(data)
+        assert result["method"] == b"OPTIONS"
+        assert result["path"] == b"*"
+
+    def test_connect_authority_still_valid(self):
+        data = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
+        result = parse_request(data)
+        assert result["method"] == b"CONNECT"
+        assert result["path"] == b"example.com:443"

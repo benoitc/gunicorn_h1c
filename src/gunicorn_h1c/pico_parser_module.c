@@ -121,6 +121,13 @@ pico_parse_request(PyObject *self, PyObject *args, PyObject *kwargs)
         return NULL;
     }
 
+    /* Validate request-target form against method (RFC 9112) */
+    if (pico_validate_request_target(method, method_len, path, path_len,
+                                      PicoError) < 0) {
+        PyBuffer_Release(&buf);
+        return NULL;
+    }
+
     /* Validate HTTP version */
     if (pico_validate_version(minor_version,
                                permit_unconventional_http_version,
@@ -392,6 +399,13 @@ pico_parse_to_wsgi_environ(PyObject *self, PyObject *args, PyObject *kwargs)
     if (pico_validate_method(method, method_len,
                               permit_unconventional_http_method,
                               InvalidRequestMethod) < 0) {
+        PyBuffer_Release(&buf);
+        return NULL;
+    }
+
+    /* Validate request-target form against method (RFC 9112) */
+    if (pico_validate_request_target(method, method_len, path, path_len,
+                                      PicoError) < 0) {
         PyBuffer_Release(&buf);
         return NULL;
     }
@@ -686,6 +700,13 @@ pico_parse_to_asgi_scope(PyObject *self, PyObject *args, PyObject *kwargs)
     if (pico_validate_method(method, method_len,
                               permit_unconventional_http_method,
                               InvalidRequestMethod) < 0) {
+        PyBuffer_Release(&buf);
+        return NULL;
+    }
+
+    /* Validate request-target form against method (RFC 9112) */
+    if (pico_validate_request_target(method, method_len, path, path_len,
+                                      PicoError) < 0) {
         PyBuffer_Release(&buf);
         return NULL;
     }
