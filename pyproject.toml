@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gunicorn_h1c"
-version = "0.6.4"
+version = "0.6.5"
 description = "Fast HTTP/1.1 parser for Gunicorn using picohttpparser"
 readme = "README.md"
 license = {text = "MIT"}

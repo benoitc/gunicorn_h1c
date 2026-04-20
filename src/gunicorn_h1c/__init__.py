@@ -25,7 +25,7 @@ Usage:
     print(req.has_chunked)    # False
 """
 
-__version__ = "0.6.4"
+__version__ = "0.6.5"
 __all__ = [
     # Basic parser
     "parse_request",

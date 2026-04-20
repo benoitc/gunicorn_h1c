@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.5] - 2026-04-20
+
+### Fixed
+
+- Reject Content-Length list form per RFC 9112 section 6.3 (e.g. `Content-Length: 42, 42`)
+
 ## [0.6.4] - 2026-04-19
 
 ### Fixed
