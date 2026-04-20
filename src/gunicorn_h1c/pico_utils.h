@@ -43,18 +43,24 @@ pico_header_name_eq(const char *name, size_t name_len,
 
 /*
  * Parse Content-Length value from header value string.
+ *
+ * RFC 9112 section 6.2: Content-Length = 1*DIGIT. The list form
+ * ("5, 5") is also a classic smuggling vector even when values match,
+ * so we reject anything that is not purely digits.
+ *
  * Returns parsed value or -1 on error.
  */
 static inline Py_ssize_t
 pico_parse_content_length(const char *value, size_t value_len)
 {
+    if (value_len == 0) return -1;
     Py_ssize_t cl = 0;
     for (size_t i = 0; i < value_len; i++) {
         char c = value[i];
         if (c >= '0' && c <= '9') {
             cl = cl * 10 + (c - '0');
         } else {
-            break;  /* Stop on non-digit */
+            return -1;
         }
     }
     return cl;
