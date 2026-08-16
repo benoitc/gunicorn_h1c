@@ -22,7 +22,9 @@ SOFTWARE.
 
 ---
 
-picohttpparser is licensed under the MIT License:
+The vendored picohttpparser sources in src/gunicorn_h1c/picohttpparser/ are
+dual-licensed under the MIT License or the Perl license by their authors. They
+are used here under the MIT License:
 
 Copyright (c) 2009-2014 Kazuho Oku, Tokuhiro Matsuno, Daisuke Murase,
                         Shigeo Mitsunari

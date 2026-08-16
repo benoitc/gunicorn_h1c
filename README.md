@@ -415,7 +415,11 @@ When parsing fails, the parser analyzes the buffer to raise the most specific ex
 
 ## License
 
-MIT License (picohttpparser) + Apache 2.0 (Python bindings)
+MIT License. See [LICENSE](LICENSE).
+
+The vendored [picohttpparser](https://github.com/h2o/picohttpparser) sources are
+also MIT licensed (dual-licensed MIT or Perl by their authors); their copyright
+notice is reproduced in `LICENSE`.
 
 ## Credits
 

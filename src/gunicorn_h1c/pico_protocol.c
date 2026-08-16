@@ -1,6 +1,8 @@
 /*
+ * SPDX-License-Identifier: MIT
+ *
  * Copyright 2026 Benoit Chesneau
- * Licensed under Apache 2.0
+ * Licensed under the MIT License (see LICENSE file).
  *
  * Callback-based HTTP/1.1 parser for asyncio integration.
  *
