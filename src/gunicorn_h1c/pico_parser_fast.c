@@ -1,6 +1,8 @@
 /*
+ * SPDX-License-Identifier: MIT
+ *
  * Copyright 2026 Benoit Chesneau
- * Licensed under Apache 2.0
+ * Licensed under the MIT License (see LICENSE file).
  *
  * Optimized Python C extension for picohttpparser.
  *
