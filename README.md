@@ -31,11 +31,11 @@ from gunicorn_h1c import parse_request
 data = b"GET /path?query=1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
 result = parse_request(data)
 
-print(result['method'])        # b'GET'
-print(result['path'])          # b'/path?query=1'
-print(result['minor_version']) # 1 (HTTP/1.1)
-print(result['headers'])       # [(b'Host', b'localhost'), (b'Content-Length', b'0')]
-print(result['consumed'])      # 67 (bytes consumed)
+print(result["method"])  # b'GET'
+print(result["path"])  # b'/path?query=1'
+print(result["minor_version"])  # 1 (HTTP/1.1)
+print(result["headers"])  # [(b'Host', b'localhost'), (b'Content-Length', b'0')]
+print(result["consumed"])  # 67 (bytes consumed)
 ```
 
 ### Fast Parsing (Zero-Copy)
@@ -43,18 +43,20 @@ print(result['consumed'])      # 67 (bytes consumed)
 ```python
 from gunicorn_h1c import parse_request_fast
 
-data = b"POST /api HTTP/1.1\r\nContent-Length: 100\r\nTransfer-Encoding: chunked\r\n\r\n"
+data = (
+    b"POST /api HTTP/1.1\r\nContent-Length: 100\r\nTransfer-Encoding: chunked\r\n\r\n"
+)
 req = parse_request_fast(data)
 
 # Properties are created lazily - only when accessed
-print(req.method)          # b'POST'
-print(req.path)            # b'/api'
-print(req.consumed)        # bytes consumed
+print(req.method)  # b'POST'
+print(req.path)  # b'/api'
+print(req.consumed)  # bytes consumed
 
 # Common headers extracted during parse (no Python overhead)
 print(req.content_length)  # 100
-print(req.has_chunked)     # True
-print(req.connection_close) # -1 (not set), 0 (keep-alive), 1 (close)
+print(req.has_chunked)  # True
+print(req.connection_close)  # -1 (not set), 0 (keep-alive), 1 (close)
 
 # Header lookup (case-insensitive)
 print(req.get_header("content-length"))  # b'100'
@@ -68,11 +70,11 @@ from gunicorn_h1c import parse_response
 data = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 13\r\n\r\n"
 result = parse_response(data)
 
-print(result['status'])        # 200
-print(result['message'])       # b'OK'
-print(result['minor_version']) # 1
-print(result['headers'])       # [(b'Content-Type', b'text/html'), ...]
-print(result['consumed'])      # bytes consumed
+print(result["status"])  # 200
+print(result["message"])  # b'OK'
+print(result["minor_version"])  # 1
+print(result["headers"])  # [(b'Content-Type', b'text/html'), ...]
+print(result["consumed"])  # bytes consumed
 ```
 
 ### Header-Only Parsing
@@ -93,22 +95,19 @@ from gunicorn_h1c import parse_to_wsgi_environ
 
 data = b"GET /path?foo=bar HTTP/1.1\r\nHost: example.com\r\nContent-Type: text/plain\r\n\r\n"
 environ = parse_to_wsgi_environ(
-    data,
-    server=("example.com", 80),
-    client=("192.168.1.1", 54321),
-    url_scheme="https"
+    data, server=("example.com", 80), client=("192.168.1.1", 54321), url_scheme="https"
 )
 
-print(environ['REQUEST_METHOD'])  # 'GET'
-print(environ['PATH_INFO'])       # '/path'
-print(environ['QUERY_STRING'])    # 'foo=bar'
-print(environ['SERVER_NAME'])     # 'example.com'
-print(environ['SERVER_PORT'])     # '80'
-print(environ['REMOTE_ADDR'])     # '192.168.1.1'
-print(environ['HTTP_HOST'])       # 'example.com'
-print(environ['CONTENT_TYPE'])    # 'text/plain'
-print(environ['wsgi.url_scheme']) # 'https'
-print(environ['_consumed'])       # bytes consumed
+print(environ["REQUEST_METHOD"])  # 'GET'
+print(environ["PATH_INFO"])  # '/path'
+print(environ["QUERY_STRING"])  # 'foo=bar'
+print(environ["SERVER_NAME"])  # 'example.com'
+print(environ["SERVER_PORT"])  # '80'
+print(environ["REMOTE_ADDR"])  # '192.168.1.1'
+print(environ["HTTP_HOST"])  # 'example.com'
+print(environ["CONTENT_TYPE"])  # 'text/plain'
+print(environ["wsgi.url_scheme"])  # 'https'
+print(environ["_consumed"])  # bytes consumed
 ```
 
 ### ASGI Scope Creation
@@ -122,22 +121,22 @@ scope = parse_to_asgi_scope(
     server=("example.com", 443),
     client=("10.0.0.1", 12345),
     scheme="https",
-    root_path="/v1"
+    root_path="/v1",
 )
 
-print(scope['type'])         # 'http'
-print(scope['asgi'])         # {'version': '3.0', 'spec_version': '2.4'}
-print(scope['http_version']) # '1.1'
-print(scope['method'])       # 'POST'
-print(scope['scheme'])       # 'https'
-print(scope['path'])         # '/api'
-print(scope['raw_path'])     # b'/api'
-print(scope['query_string']) # b''
-print(scope['root_path'])    # '/v1'
-print(scope['headers'])      # [(b'host', b'example.com'), ...]
-print(scope['server'])       # ('example.com', 443)
-print(scope['client'])       # ('10.0.0.1', 12345)
-print(scope['_consumed'])    # bytes consumed
+print(scope["type"])  # 'http'
+print(scope["asgi"])  # {'version': '3.0', 'spec_version': '2.4'}
+print(scope["http_version"])  # '1.1'
+print(scope["method"])  # 'POST'
+print(scope["scheme"])  # 'https'
+print(scope["path"])  # '/api'
+print(scope["raw_path"])  # b'/api'
+print(scope["query_string"])  # b''
+print(scope["root_path"])  # '/v1'
+print(scope["headers"])  # [(b'host', b'example.com'), ...]
+print(scope["server"])  # ('example.com', 443)
+print(scope["client"])  # ('10.0.0.1', 12345)
+print(scope["_consumed"])  # bytes consumed
 ```
 
 ### Callback-Based Protocol Parser (asyncio)
@@ -148,6 +147,7 @@ synchronous parsing in `data_received()`:
 ```python
 import asyncio
 from gunicorn_h1c import H1CProtocol
+
 
 class MyProtocol(asyncio.Protocol):
     def connection_made(self, transport):
@@ -167,7 +167,7 @@ class MyProtocol(asyncio.Protocol):
     def _on_headers(self):
         # Build ASGI scope or process headers
         method = self.parser.method  # b'GET'
-        path = self.parser.path      # b'/path'
+        path = self.parser.path  # b'/path'
         headers = self.parser.headers  # [(b'Host', b'localhost'), ...]
 
         # Return True to skip body parsing (e.g., for HEAD requests)
@@ -202,15 +202,14 @@ except LimitRequestHeaders:
 # Custom limits
 result = parse_request(
     data,
-    limit_request_line=4096,      # Max request line length
-    limit_request_fields=50,       # Max number of headers
-    limit_request_field_size=4096  # Max header size (name + value)
+    limit_request_line=4096,  # Max request line length
+    limit_request_fields=50,  # Max number of headers
+    limit_request_field_size=4096,  # Max header size (name + value)
 )
 
 # Allow unconventional methods (lowercase, short, etc.)
 result = parse_request(
-    b"get / HTTP/1.1\r\n\r\n",
-    permit_unconventional_http_method=True
+    b"get / HTTP/1.1\r\n\r\n", permit_unconventional_http_method=True
 )
 ```
 
@@ -243,10 +242,19 @@ result = parse_request_raw(data)
 
 # Returns: (method_offset, method_len, path_offset, path_len,
 #           minor_version, header_count, consumed, header_data)
-method_offset, method_len, path_offset, path_len, version, header_count, consumed, header_data = result
+(
+    method_offset,
+    method_len,
+    path_offset,
+    path_len,
+    version,
+    header_count,
+    consumed,
+    header_data,
+) = result
 
-method = data[method_offset:method_offset + method_len]  # b'GET'
-path = data[path_offset:path_offset + path_len]          # b'/path'
+method = data[method_offset : method_offset + method_len]  # b'GET'
+path = data[path_offset : path_offset + path_len]  # b'/path'
 ```
 
 ## Performance
@@ -322,14 +330,14 @@ Callback-based HTTP/1.1 parser for asyncio integration.
 **Constructor:**
 ```python
 H1CProtocol(
-    on_message_begin=None,      # () -> None
-    on_url=None,                # (url: bytes) -> None
-    on_header=None,             # (name: bytes, value: bytes) -> None
-    on_headers_complete=None,   # () -> bool (return True to skip body)
-    on_body=None,               # (chunk: bytes) -> None
-    on_message_complete=None,   # () -> None
-    limit_request_line=8190,    # Maximum request line length
-    limit_request_fields=100,   # Maximum number of headers
+    on_message_begin=None,  # () -> None
+    on_url=None,  # (url: bytes) -> None
+    on_header=None,  # (name: bytes, value: bytes) -> None
+    on_headers_complete=None,  # () -> bool (return True to skip body)
+    on_body=None,  # (chunk: bytes) -> None
+    on_message_complete=None,  # () -> None
+    limit_request_line=8190,  # Maximum request line length
+    limit_request_fields=100,  # Maximum number of headers
     limit_request_field_size=8190,  # Maximum header size
     permit_unconventional_http_method=False,
     permit_unconventional_http_version=False,
