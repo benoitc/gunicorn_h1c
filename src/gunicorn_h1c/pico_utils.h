@@ -14,6 +14,33 @@
 #include <Python.h>
 #include "picohttpparser.h"
 
+/*
+ * RFC 9110 section 5.3: fields whose grammar admits only a single member.
+ * A repeat cannot be merged into a comma-separated list, so the message is
+ * ambiguous and gunicorn, a cache, or an upstream proxy may each resolve it
+ * differently. Duplicate Host in particular is a routing- and
+ * cache-confusion vector, so all of these are rejected outright.
+ *
+ * Transfer-Encoding is deliberately NOT listed: repeats there are legal and
+ * are handled by the framing checks below.
+ *
+ * This is the only place the singleton set is stated. `name` must be
+ * lowercase (matching pico_header_name_eq); `display` is the canonical
+ * spelling used in the error message.
+ */
+static const struct {
+    const char *name;
+    size_t name_len;
+    const char *display;
+} pico_singleton_fields[] = {
+    {"host",           4,  "Host"},
+    {"content-length", 14, "Content-Length"},
+    {"content-type",   12, "Content-Type"},
+};
+
+#define PICO_SINGLETON_FIELD_COUNT \
+    (sizeof(pico_singleton_fields) / sizeof(pico_singleton_fields[0]))
+
 /* Shared header extraction info */
 typedef struct {
     Py_ssize_t content_length;  /* -1 if not set */
@@ -24,6 +51,8 @@ typedef struct {
     int chunked_count;          /* Number of "chunked" values seen */
     int has_te_after_chunked;   /* 1 if T-E value after chunked */
     int has_unknown_te;         /* 1 if unknown Transfer-Encoding value */
+    unsigned int singleton_seen; /* Bitmask of pico_singleton_fields seen */
+    int duplicate_singleton;    /* Index of first repeated singleton, -1 if none */
 } PicoHeaderInfo;
 
 /*
@@ -266,7 +295,8 @@ pico_parse_transfer_encoding(const char *value, size_t value_len, PicoHeaderInfo
 /*
  * Extract special headers into PicoHeaderInfo.
  * Processes Content-Length, Transfer-Encoding, Connection, and Upgrade headers.
- * Also performs validation for request smuggling prevention.
+ * Also records repeats of the singleton fields and performs validation for
+ * request smuggling prevention.
  */
 static inline void
 pico_extract_headers(struct phr_header *headers, size_t num_headers,
@@ -280,6 +310,8 @@ pico_extract_headers(struct phr_header *headers, size_t num_headers,
     info->chunked_count = 0;
     info->has_te_after_chunked = 0;
     info->has_unknown_te = 0;
+    info->singleton_seen = 0;
+    info->duplicate_singleton = -1;
 
     for (size_t i = 0; i < num_headers; i++) {
         const char *name = headers[i].name;
@@ -287,12 +319,27 @@ pico_extract_headers(struct phr_header *headers, size_t num_headers,
         const char *value = headers[i].value;
         size_t value_len = headers[i].value_len;
 
-        if (pico_header_name_eq(name, name_len, "content-length", 14)) {
-            /* Track if we already saw Content-Length (duplicate detection) */
-            if (info->has_content_length) {
-                /* Second Content-Length - mark for rejection */
-                info->content_length = -2;  /* Special value for duplicate */
+        /* Singleton field repeat detection (case-insensitive) */
+        for (size_t s = 0; s < PICO_SINGLETON_FIELD_COUNT; s++) {
+            if (!pico_header_name_eq(name, name_len,
+                                     pico_singleton_fields[s].name,
+                                     pico_singleton_fields[s].name_len)) {
+                continue;
+            }
+            unsigned int bit = 1u << s;
+            if (info->singleton_seen & bit) {
+                if (info->duplicate_singleton < 0) {
+                    info->duplicate_singleton = (int)s;
+                }
             } else {
+                info->singleton_seen |= bit;
+            }
+            break;
+        }
+
+        if (pico_header_name_eq(name, name_len, "content-length", 14)) {
+            /* Keep the first value; a repeat is rejected by the framing check */
+            if (!info->has_content_length) {
                 info->content_length = pico_parse_content_length(value, value_len);
                 info->has_content_length = 1;
             }
@@ -319,7 +366,7 @@ pico_extract_headers(struct phr_header *headers, size_t num_headers,
  * Returns 0 on success, -1 on error (sets Python exception).
  *
  * Checks:
- * - Duplicate Content-Length headers
+ * - Repeated singleton fields (Host, Content-Length, Content-Type)
  * - Content-Length with Transfer-Encoding (CL+TE conflict)
  * - Chunked encoding in HTTP/1.0
  * - Stacked chunked encoding
@@ -330,9 +377,10 @@ static inline int
 pico_validate_header_framing(PicoHeaderInfo *info, int minor_version,
                               PyObject *InvalidHeader)
 {
-    /* Check for duplicate Content-Length */
-    if (info->content_length == -2) {
-        PyErr_SetString(InvalidHeader, "Duplicate Content-Length header");
+    /* Check for a repeated singleton field (RFC 9110 section 5.3) */
+    if (info->duplicate_singleton >= 0) {
+        PyErr_Format(InvalidHeader, "Duplicate %s header",
+                     pico_singleton_fields[info->duplicate_singleton].display);
         return -1;
     }
 
