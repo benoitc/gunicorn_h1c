@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.6] - 2026-08-17
+
+### Security
+
+- Reject repeated singleton header fields per RFC 9110 section 5.3. `Host` and
+  `Content-Type` now raise `InvalidHeader` on a repeat, as `Content-Length`
+  already did. A repeat cannot be merged into a list, so the message is
+  ambiguous and gunicorn, a cache, and an upstream proxy may each resolve it
+  differently. Duplicate `Host` is a routing- and cache-confusion vector.
+
+### Changed
+
+- The singleton field set is now stated in one place in `pico_utils.h`, shared
+  by `parse_request`, `parse_request_fast`, `parse_to_wsgi_environ`,
+  `parse_to_asgi_scope`, and `H1CProtocol.feed()`. Response parsing is
+  unaffected.
+- Repeated `Transfer-Encoding` remains accepted; it is not a singleton field and
+  its repeats are handled by the framing checks.
+
+### Compatibility
+
+- This turns requests that previously parsed into 400 Bad Request. That is
+  intended, and it matches what the pure-Python parser does, but it is a
+  behavior change for anyone sitting behind a proxy that duplicates `Host`. Such
+  a proxy is itself non-conformant, and that ambiguity is the reason for the
+  change. Duplicate list-valued fields (`Accept`, `Via`, `X-Forwarded-For`,
+  `Set-Cookie`, and so on) are unaffected.
+
 ## [0.6.5] - 2026-04-20
 
 ### Fixed
