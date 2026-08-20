@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.8] - 2026-08-20
+
+### Fixed
+
+- Bound the tail retained after a completed message. 0.6.7 kept everything fed
+  to an already-complete parser, so a caller that feeds every socket read
+  without checking `is_complete` let a client grow the parser buffer without
+  limit between the end of a message and `reset()`. The tail now stops at
+  `limit_remaining` (64 KB by default, `0` disables the cap).
+
+### Added
+
+- `limit_remaining` constructor argument and the `remaining_truncated`
+  property, true once the tail has hit the cap and bytes have been dropped.
+
+`feed()` never raises on overflow: it discards the excess, exactly as every
+version before 0.6.7 discarded the whole tail. Callers that ignore
+`remaining()` are unaffected apart from the memory bound.
+
 ## [0.6.7] - 2026-08-20
 
 ### Added
