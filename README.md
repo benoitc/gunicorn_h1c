@@ -341,6 +341,7 @@ H1CProtocol(
     limit_request_field_size=8190,  # Maximum header size
     permit_unconventional_http_method=False,
     permit_unconventional_http_version=False,
+    limit_remaining=65536,  # Max bytes retained after a message (0 = unlimited)
 )
 ```
 
@@ -360,6 +361,7 @@ H1CProtocol(
 - `should_keep_alive`: bool - True if connection should be kept alive
 - `should_upgrade`: bool - True if Upgrade header present
 - `is_complete`: bool - True if message parsing is complete
+- `remaining_truncated`: bool - True if the tail hit `limit_remaining`
 
 #### Unconsumed bytes after a message
 
@@ -401,8 +403,13 @@ p.feed(tail)  # parsed as the next request
 ```
 
 - Once a message is complete, everything you feed is retained until you call
-  `reset()`. Stop feeding a completed parser, or drain it, rather than pumping
-  a whole connection through `feed()`.
+  `reset()`, up to `limit_remaining` (64 KB by default). Past that the excess
+  is dropped and `remaining_truncated` becomes true. `feed()` never raises on
+  overflow, so a caller that keeps feeding a completed parser sees bounded
+  memory rather than an error.
+- Set `limit_remaining=0` for no cap. Only do that if you drain the tail
+  promptly: a client that streams into a completed parser can then grow it
+  without bound.
 
 ### Response Parsing
 
