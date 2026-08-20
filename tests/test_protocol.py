@@ -672,3 +672,205 @@ class TestH1CProtocolLimitValidation:
         # This ensures gunicorn can catch these with a single ParseError handler
         assert issubclass(LimitRequestLine, ParseError)
         assert issubclass(LimitRequestHeaders, ParseError)
+
+
+class TestH1CProtocolRemaining:
+    """remaining() exposes bytes fed after a completed message.
+
+    gunicorn's ASGI worker feeds whole data_received() buffers into feed(),
+    so anything a client pipelines behind the request lands in the same call:
+    the HTTP/2 preface after Upgrade: h2c, a WebSocket frame sent straight
+    after the handshake, or a second HTTP/1 request.
+    """
+
+    H2C_UPGRADE = (
+        b"GET / HTTP/1.1\r\nHost: a\r\nUpgrade: h2c\r\n"
+        b"Connection: Upgrade, HTTP2-Settings\r\n"
+        b"HTTP2-Settings: AAMAAABkAAQAoAAAAAIAAAAA\r\n\r\n"
+    )
+    H2C_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+
+    def test_h2c_preface_recovered(self):
+        """The blocking case: HTTP/2 preface pipelined behind the upgrade."""
+        p = H1CProtocol()
+        p.feed(self.H2C_UPGRADE + self.H2C_PREFACE)
+
+        assert p.is_complete
+        assert p.should_upgrade
+        assert p.remaining() == self.H2C_PREFACE
+
+    def test_websocket_frame_after_handshake(self):
+        """A client frame sent immediately after the handshake survives."""
+        frame = b"\x81\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58"
+        p = H1CProtocol()
+        p.feed(
+            b"GET /ws HTTP/1.1\r\nHost: a\r\n"
+            b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n" + frame
+        )
+
+        assert p.is_complete
+        assert p.remaining() == frame
+
+    def test_pipelined_request(self):
+        """A second HTTP/1 request in the same segment is recoverable."""
+        second = b"GET /2 HTTP/1.1\r\nHost: a\r\n\r\n"
+        p = H1CProtocol()
+        p.feed(b"GET /1 HTTP/1.1\r\nHost: a\r\n\r\n" + second)
+
+        assert p.path == b"/1"
+        assert p.remaining() == second
+
+    def test_no_tail_is_empty_bytes(self):
+        p = H1CProtocol()
+        p.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+
+        assert p.is_complete
+        assert p.remaining() == b""
+
+    def test_empty_while_incomplete(self):
+        """While a message is still parsing, every byte fed belongs to it."""
+        p = H1CProtocol()
+        p.feed(b"GET / HTTP/1.1\r\nHost: ")
+
+        assert not p.is_complete
+        assert p.remaining() == b""
+
+    def test_empty_mid_body(self):
+        p = H1CProtocol()
+        p.feed(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhel")
+
+        assert not p.is_complete
+        assert p.remaining() == b""
+
+    def test_content_length_body_tail(self):
+        """Tail is measured from the end of the body, not the headers."""
+        p = H1CProtocol()
+        p.feed(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhelloTAIL")
+
+        assert p.is_complete
+        assert p.remaining() == b"TAIL"
+
+    def test_chunked_body_tail(self):
+        """Same for a chunked body: measured past the terminating chunk."""
+        p = H1CProtocol()
+        p.feed(
+            b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n"
+            b"5\r\nhello\r\n0\r\n\r\nAFTER"
+        )
+
+        assert p.is_complete
+        assert p.remaining() == b"AFTER"
+
+    def test_chunked_with_trailer_tail(self):
+        p = H1CProtocol()
+        p.feed(
+            b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n"
+            b"5\r\nhello\r\n0\r\nX-Trace-Id: 1\r\n\r\nAFTER"
+        )
+
+        assert p.is_complete
+        assert p.remaining() == b"AFTER"
+
+    def test_tail_split_across_feeds(self):
+        """A tail arriving in pieces is accumulated, not truncated."""
+        p = H1CProtocol()
+        p.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\nPRI * HTTP")
+        p.feed(b"/2.0\r\n\r\nSM\r\n\r\n")
+
+        assert p.remaining() == self.H2C_PREFACE
+
+    def test_tail_split_byte_by_byte(self):
+        p = H1CProtocol()
+        p.feed(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+        for byte in b"abcdef":
+            p.feed(bytes([byte]))
+
+        assert p.remaining() == b"abcdef"
+
+    def test_message_split_before_tail(self):
+        """Headers split across feeds, tail arriving with the body."""
+        p = H1CProtocol()
+        p.feed(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Len")
+        p.feed(b"gth: 5\r\n\r\nhelloTAIL")
+
+        assert p.is_complete
+        assert p.remaining() == b"TAIL"
+
+    def test_body_split_before_tail(self):
+        p = H1CProtocol()
+        p.feed(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhel")
+        p.feed(b"loTAIL")
+
+        assert p.is_complete
+        assert p.remaining() == b"TAIL"
+
+    def test_chunked_split_before_tail(self):
+        p = H1CProtocol()
+        p.feed(
+            b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel"
+        )
+        p.feed(b"lo\r\n0\r\n")
+        assert not p.is_complete
+        p.feed(b"\r\nAFTER")
+
+        assert p.is_complete
+        assert p.remaining() == b"AFTER"
+
+    def test_reset_drops_the_tail(self):
+        """reset() must not leak the tail into the next message."""
+        p = H1CProtocol()
+        p.feed(b"GET /1 HTTP/1.1\r\nHost: a\r\n\r\nGET /2 HTTP/1.1\r\nHost: b\r\n\r\n")
+        assert p.remaining() != b""
+
+        p.reset()
+
+        assert p.remaining() == b""
+
+    def test_reset_then_feed_tail_parses_pipeline(self):
+        """The keepalive loop: capture, reset, feed back."""
+        p = H1CProtocol()
+        p.feed(
+            b"GET /1 HTTP/1.1\r\nHost: a\r\n\r\n"
+            b"GET /2 HTTP/1.1\r\nHost: b\r\n\r\n"
+            b"GET /3 HTTP/1.1\r\nHost: c\r\n\r\n"
+        )
+
+        paths = [p.path]
+        tail = p.remaining()
+        while tail:
+            p.reset()
+            p.feed(tail)
+            paths.append(p.path)
+            tail = p.remaining()
+
+        assert paths == [b"/1", b"/2", b"/3"]
+
+    def test_pipelined_bodies_survive_reset(self):
+        """Bodies too, not just header-only requests."""
+        bodies = []
+        p = H1CProtocol(on_body=bodies.append)
+        p.feed(
+            b"POST /1 HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\n\r\nabc"
+            b"POST /2 HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\n\r\ndef"
+        )
+        assert bodies == [b"abc"]
+
+        tail = p.remaining()
+        p.reset()
+        p.feed(tail)
+
+        assert p.path == b"/2"
+        assert bodies == [b"abc", b"def"]
+        assert p.remaining() == b""
+
+    def test_finish_reports_no_tail(self):
+        """At EOF nothing follows, so a half-parsed trailer is not a tail."""
+        p = H1CProtocol()
+        p.feed(
+            b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n"
+            b"5\r\nhello\r\n0\r\n"
+        )
+        p.finish()
+
+        assert p.is_complete
+        assert p.remaining() == b""
