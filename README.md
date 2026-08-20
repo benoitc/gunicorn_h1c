@@ -346,8 +346,9 @@ H1CProtocol(
 
 **Methods:**
 - `feed(data: bytes) -> None`: Feed data to parser. Callbacks fire synchronously.
-- `reset() -> None`: Reset parser for next request (keepalive).
+- `reset() -> None`: Reset parser for next request (keepalive). Drops any tail; see below.
 - `get_header(name: bytes) -> bytes | None`: Case-insensitive header lookup.
+- `remaining() -> bytes`: Bytes fed after the completed message. See below.
 
 **Properties (valid after on_headers_complete):**
 - `method`: bytes - HTTP method (GET, POST, etc.)
@@ -359,6 +360,49 @@ H1CProtocol(
 - `should_keep_alive`: bool - True if connection should be kept alive
 - `should_upgrade`: bool - True if Upgrade header present
 - `is_complete`: bool - True if message parsing is complete
+
+#### Unconsumed bytes after a message
+
+When you feed a whole socket read, bytes belonging to whatever follows the
+request can arrive in the same call: the HTTP/2 preface after an
+`Upgrade: h2c`, a WebSocket frame sent straight after the handshake, or a
+pipelined second request. `remaining()` hands those back.
+
+```python
+p = H1CProtocol()
+p.feed(
+    b"GET / HTTP/1.1\r\nHost: a\r\nUpgrade: h2c\r\n"
+    b"Connection: Upgrade, HTTP2-Settings\r\n"
+    b"HTTP2-Settings: AAMAAABkAAQAoAAAAAIAAAAA\r\n\r\n"
+    b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+)
+
+p.is_complete  # True
+p.should_upgrade  # True
+p.remaining()  # b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n' - hand to the HTTP/2 connection
+```
+
+Notes:
+
+- `remaining()` returns `b""` until `is_complete` is true. While a message is
+  still being parsed every byte fed so far belongs to it, so there is nothing
+  to report.
+- The tail is measured from the end of the message, not the end of the
+  headers. For a body, that means past the last body byte or past the
+  terminating chunk and its trailers.
+- A tail split over several `feed()` calls is accumulated, so you can keep
+  feeding until you are ready to read it.
+- `reset()` drops the tail. For pipelining, read it first and feed it back:
+
+```python
+tail = p.remaining()
+p.reset()
+p.feed(tail)  # parsed as the next request
+```
+
+- Once a message is complete, everything you feed is retained until you call
+  `reset()`. Stop feeding a completed parser, or drain it, rather than pumping
+  a whole connection through `feed()`.
 
 ### Response Parsing
 

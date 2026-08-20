@@ -89,8 +89,11 @@ typedef struct {
 
 /* Forward declarations */
 static int H1CProtocol_feed_headers(H1CProtocol *self);
-static int H1CProtocol_feed_body_content_length(H1CProtocol *self, const char *data, size_t len);
+static int H1CProtocol_feed_body_content_length(H1CProtocol *self, const char *data,
+                                                size_t len, int data_is_buffer);
 static int H1CProtocol_feed_body_chunked(H1CProtocol *self);
+static int H1CProtocol_keep_tail(H1CProtocol *self, const char *data, size_t len,
+                                 size_t consumed, int data_is_buffer);
 
 /* header_name_eq moved to pico_utils.h as pico_header_name_eq */
 
@@ -117,6 +120,41 @@ ensure_buffer_capacity(H1CProtocol *self, size_t additional)
 
     self->buffer = new_buffer;
     self->buffer_size = new_size;
+    return 0;
+}
+
+/*
+ * Keep the bytes that follow a finished message so remaining() can hand them
+ * back: a pipelined request, a WebSocket frame sent straight after the
+ * handshake, or the HTTP/2 preface after an Upgrade: h2c request.
+ *
+ * `data` is the block just parsed and `consumed` how much of it the message
+ * used. data_is_buffer says whether `data` points into self->buffer (body fed
+ * on from the header buffer) or at caller-owned memory, since the first case
+ * must shift in place rather than copy over itself.
+ */
+static int
+H1CProtocol_keep_tail(H1CProtocol *self, const char *data, size_t len,
+                      size_t consumed, int data_is_buffer)
+{
+    size_t tail_len = len - consumed;
+
+    if (tail_len == 0) {
+        self->buffer_len = 0;
+        return 0;
+    }
+
+    if (data_is_buffer) {
+        memmove(self->buffer, data + consumed, tail_len);
+    } else {
+        self->buffer_len = 0;
+        if (ensure_buffer_capacity(self, tail_len) < 0) {
+            return -1;
+        }
+        memcpy(self->buffer, data + consumed, tail_len);
+    }
+
+    self->buffer_len = tail_len;
     return 0;
 }
 
@@ -288,7 +326,7 @@ H1CProtocol_feed(H1CProtocol *self, PyObject *args)
         }
     }
     else if (self->state == STATE_BODY) {
-        int ret = H1CProtocol_feed_body_content_length(self, buf.buf, buf.len);
+        int ret = H1CProtocol_feed_body_content_length(self, buf.buf, buf.len, 0);
         PyBuffer_Release(&buf);
         if (ret < 0) {
             return NULL;
@@ -308,6 +346,18 @@ H1CProtocol_feed(H1CProtocol *self, PyObject *args)
         if (H1CProtocol_feed_body_chunked(self) < 0) {
             return NULL;
         }
+    }
+    else if (self->state == STATE_COMPLETE) {
+        /* The message is already finished, so every byte here belongs to
+         * whatever follows it. Accumulate so a tail split across several
+         * feed() calls still arrives whole. */
+        if (ensure_buffer_capacity(self, buf.len) < 0) {
+            PyBuffer_Release(&buf);
+            return NULL;
+        }
+        memcpy(self->buffer + self->buffer_len, buf.buf, buf.len);
+        self->buffer_len += buf.len;
+        PyBuffer_Release(&buf);
     }
     else {
         PyBuffer_Release(&buf);
@@ -518,7 +568,7 @@ H1CProtocol_feed_headers(H1CProtocol *self)
         self->state = STATE_BODY;
         if (remaining > 0) {
             return H1CProtocol_feed_body_content_length(
-                self, self->buffer, remaining);
+                self, self->buffer, remaining, 1);
         }
     }
     else {
@@ -538,12 +588,18 @@ H1CProtocol_feed_headers(H1CProtocol *self)
  * Parse body with Content-Length.
  */
 static int
-H1CProtocol_feed_body_content_length(H1CProtocol *self, const char *data, size_t len)
+H1CProtocol_feed_body_content_length(H1CProtocol *self, const char *data,
+                                     size_t len, int data_is_buffer)
 {
     if (self->skip_body) {
         if ((Py_ssize_t)len >= self->body_remaining) {
+            size_t consumed = (size_t)self->body_remaining;
             self->body_remaining = 0;
             self->state = STATE_COMPLETE;
+            if (H1CProtocol_keep_tail(self, data, len, consumed,
+                                      data_is_buffer) < 0) {
+                return -1;
+            }
             if (self->on_message_complete) {
                 PyObject *result = PyObject_CallNoArgs(self->on_message_complete);
                 if (!result) return -1;
@@ -551,9 +607,9 @@ H1CProtocol_feed_body_content_length(H1CProtocol *self, const char *data, size_t
             }
         } else {
             self->body_remaining -= len;
+            /* Clear buffer since we're not using buffered data for body */
+            self->buffer_len = 0;
         }
-        /* Clear buffer since we're not using buffered data for body */
-        self->buffer_len = 0;
         return 0;
     }
 
@@ -575,10 +631,18 @@ H1CProtocol_feed_body_content_length(H1CProtocol *self, const char *data, size_t
     }
 
     self->body_remaining -= to_consume;
-    self->buffer_len = 0;  /* Clear buffer */
+
+    if (self->body_remaining > 0) {
+        self->buffer_len = 0;  /* Clear buffer */
+    }
 
     if (self->body_remaining == 0) {
         self->state = STATE_COMPLETE;
+        /* Anything past the body belongs to the next message */
+        if (H1CProtocol_keep_tail(self, data, len, to_consume,
+                                  data_is_buffer) < 0) {
+            return -1;
+        }
         if (self->on_message_complete) {
             PyObject *result = PyObject_CallNoArgs(self->on_message_complete);
             if (!result) return -1;
@@ -767,6 +831,21 @@ H1CProtocol_feed_body_chunked(H1CProtocol *self)
 }
 
 /*
+ * Return the bytes fed to the parser that follow the finished message.
+ */
+static PyObject *
+H1CProtocol_remaining(H1CProtocol *self, PyObject *Py_UNUSED(ignored))
+{
+    /* Only meaningful once the message is complete. While one is still being
+     * parsed, every byte fed so far belongs to it, so report nothing. */
+    if (self->state != STATE_COMPLETE) {
+        return PyBytes_FromStringAndSize(NULL, 0);
+    }
+
+    return PyBytes_FromStringAndSize(self->buffer, (Py_ssize_t)self->buffer_len);
+}
+
+/*
  * Mark parsing complete for EOF handling.
  * Call when no more data will be received. Handles edge cases like
  * chunked encoding without final trailer CRLF.
@@ -777,6 +856,8 @@ H1CProtocol_finish(H1CProtocol *self, PyObject *Py_UNUSED(ignored))
     if (self->state == STATE_BODY_CHUNKED_TRAILER) {
         /* All body data received, just missing final CRLF */
         self->state = STATE_COMPLETE;
+        /* EOF: nothing follows, so any half-parsed trailer is not a tail */
+        self->buffer_len = 0;
         if (self->on_message_complete) {
             PyObject *result = PyObject_CallNoArgs(self->on_message_complete);
             if (!result) return NULL;
@@ -793,6 +874,8 @@ static PyObject *
 H1CProtocol_reset(H1CProtocol *self, PyObject *Py_UNUSED(ignored))
 {
     self->state = STATE_IDLE;
+    /* Drops any tail: capture remaining() first, then feed it back after
+     * reset() so it is parsed as the next message. */
     self->buffer_len = 0;
     self->last_len = 0;
 
@@ -1017,6 +1100,8 @@ static PyMethodDef H1CProtocol_methods[] = {
      "Reset the parser for the next request (keepalive)."},
     {"get_header", (PyCFunction)H1CProtocol_get_header, METH_VARARGS,
      "Get header value by name (case-insensitive)."},
+    {"remaining", (PyCFunction)H1CProtocol_remaining, METH_NOARGS,
+     "Bytes fed after the completed message (b'' if none or not complete)."},
     {NULL}
 };
 

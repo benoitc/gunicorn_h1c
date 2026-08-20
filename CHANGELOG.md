@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.7] - 2026-08-20
+
+### Added
+
+- `H1CProtocol.remaining()` returns the bytes fed after a completed message.
+  Callers that feed whole socket reads can now recover what a client pipelined
+  behind the request: the HTTP/2 preface after an `Upgrade: h2c` (which
+  unblocks cleartext HTTP/2 on gunicorn's ASGI worker), a WebSocket frame sent
+  straight after the handshake, or a second HTTP/1 request.
+
+  - Returns `b""` until `is_complete` is true, since every byte fed to an
+    in-progress message belongs to it.
+  - Measured from the end of the message, so past the body or the terminating
+    chunk and its trailers, not the end of the headers.
+  - A tail split over several `feed()` calls is accumulated.
+  - `reset()` drops the tail; read it first and feed it back to parse a
+    pipelined request.
+
+### Changed
+
+- Bytes fed to an already-complete parser are retained for `remaining()`
+  instead of being discarded. Stop feeding a completed parser, or drain it with
+  `remaining()` and `reset()`, rather than pumping a whole connection through
+  `feed()`.
+
 ## [0.6.6] - 2026-08-17
 
 ### Security
