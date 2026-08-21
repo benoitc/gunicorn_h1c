@@ -210,7 +210,7 @@ H1CProtocol_dealloc(H1CProtocol *self)
 }
 
 static int
-H1CProtocol_init(H1CProtocol *self, PyObject *args, PyObject *kwargs)
+H1CProtocol_init_impl(H1CProtocol *self, PyObject *args, PyObject *kwargs)
 {
     static char *kwlist[] = {
         "on_message_begin", "on_url", "on_header",
@@ -318,11 +318,23 @@ H1CProtocol_init(H1CProtocol *self, PyObject *args, PyObject *kwargs)
     return 0;
 }
 
+static int
+H1CProtocol_init(H1CProtocol *self, PyObject *args, PyObject *kwargs)
+{
+    int result;
+
+    Py_BEGIN_CRITICAL_SECTION((PyObject *)self);
+    result = H1CProtocol_init_impl(self, args, kwargs);
+    Py_END_CRITICAL_SECTION();
+
+    return result;
+}
+
 /*
  * Feed data to the parser. Callbacks fire synchronously.
  */
 static PyObject *
-H1CProtocol_feed(H1CProtocol *self, PyObject *args)
+H1CProtocol_feed_impl(H1CProtocol *self, PyObject *args)
 {
     Py_buffer buf;
 
@@ -902,7 +914,7 @@ H1CProtocol_feed_body_chunked(H1CProtocol *self)
  * Return the bytes fed to the parser that follow the finished message.
  */
 static PyObject *
-H1CProtocol_remaining(H1CProtocol *self, PyObject *Py_UNUSED(ignored))
+H1CProtocol_remaining_impl(H1CProtocol *self, PyObject *Py_UNUSED(ignored))
 {
     /* Only meaningful once the message is complete. While one is still being
      * parsed, every byte fed so far belongs to it, so report nothing. */
@@ -917,7 +929,7 @@ H1CProtocol_remaining(H1CProtocol *self, PyObject *Py_UNUSED(ignored))
  * True if the tail overflowed limit_remaining and bytes were dropped.
  */
 static PyObject *
-H1CProtocol_get_remaining_truncated(H1CProtocol *self, void *closure)
+H1CProtocol_get_remaining_truncated_impl(H1CProtocol *self, void *closure)
 {
     return PyBool_FromLong(self->remaining_truncated);
 }
@@ -928,7 +940,7 @@ H1CProtocol_get_remaining_truncated(H1CProtocol *self, void *closure)
  * chunked encoding without final trailer CRLF.
  */
 static PyObject *
-H1CProtocol_finish(H1CProtocol *self, PyObject *Py_UNUSED(ignored))
+H1CProtocol_finish_impl(H1CProtocol *self, PyObject *Py_UNUSED(ignored))
 {
     if (self->state == STATE_BODY_CHUNKED_TRAILER) {
         /* All body data received, just missing final CRLF */
@@ -948,7 +960,7 @@ H1CProtocol_finish(H1CProtocol *self, PyObject *Py_UNUSED(ignored))
  * Reset the parser for the next request (keepalive).
  */
 static PyObject *
-H1CProtocol_reset(H1CProtocol *self, PyObject *Py_UNUSED(ignored))
+H1CProtocol_reset_impl(H1CProtocol *self, PyObject *Py_UNUSED(ignored))
 {
     self->state = STATE_IDLE;
     /* Drops any tail: capture remaining() first, then feed it back after
@@ -983,7 +995,7 @@ H1CProtocol_reset(H1CProtocol *self, PyObject *Py_UNUSED(ignored))
 /* Property getters */
 
 static PyObject *
-H1CProtocol_get_method(H1CProtocol *self, void *closure)
+H1CProtocol_get_method_impl(H1CProtocol *self, void *closure)
 {
     if (self->py_method) {
         Py_INCREF(self->py_method);
@@ -993,7 +1005,7 @@ H1CProtocol_get_method(H1CProtocol *self, void *closure)
 }
 
 static PyObject *
-H1CProtocol_get_path(H1CProtocol *self, void *closure)
+H1CProtocol_get_path_impl(H1CProtocol *self, void *closure)
 {
     if (self->py_path) {
         Py_INCREF(self->py_path);
@@ -1003,23 +1015,40 @@ H1CProtocol_get_path(H1CProtocol *self, void *closure)
 }
 
 static PyObject *
-H1CProtocol_get_http_version(H1CProtocol *self, void *closure)
+H1CProtocol_get_http_version_impl(H1CProtocol *self, void *closure)
 {
     return Py_BuildValue("(ii)", 1, self->minor_version);
 }
 
 static PyObject *
-H1CProtocol_get_headers(H1CProtocol *self, void *closure)
+H1CProtocol_get_headers_impl(H1CProtocol *self, void *closure)
 {
     if (self->py_headers) {
+#ifdef Py_GIL_DISABLED
+        /* Do not expose the internal list: callers could mutate it without
+         * holding the protocol's critical section while other methods use
+         * borrowed references to its items.
+         *
+         * Keep the source list alive while copying it.  PyList_GetSlice()
+         * may suspend this object's critical section while acquiring the
+         * list's lock, allowing another thread to replace py_headers.
+         */
+        PyObject *headers = self->py_headers;
+        Py_INCREF(headers);
+        PyObject *result = PyList_GetSlice(headers, 0,
+                                           PyList_GET_SIZE(headers));
+        Py_DECREF(headers);
+        return result;
+#else
         Py_INCREF(self->py_headers);
         return self->py_headers;
+#endif
     }
     return PyList_New(0);
 }
 
 static PyObject *
-H1CProtocol_get_asgi_headers(H1CProtocol *self, void *closure)
+H1CProtocol_get_asgi_headers_impl(H1CProtocol *self, void *closure)
 {
     if (!self->py_headers) {
         return PyList_New(0);
@@ -1042,8 +1071,7 @@ H1CProtocol_get_asgi_headers(H1CProtocol *self, void *closure)
                 name_str, name_len,
                 PyBytes_AS_STRING(value), PyBytes_GET_SIZE(value));
             if (!pair) {
-                Py_DECREF(self->py_asgi_headers);
-                self->py_asgi_headers = NULL;
+                Py_CLEAR(self->py_asgi_headers);
                 return NULL;
             }
             PyList_SET_ITEM(self->py_asgi_headers, i, pair);
@@ -1054,7 +1082,7 @@ H1CProtocol_get_asgi_headers(H1CProtocol *self, void *closure)
 }
 
 static PyObject *
-H1CProtocol_get_content_length(H1CProtocol *self, void *closure)
+H1CProtocol_get_content_length_impl(H1CProtocol *self, void *closure)
 {
     if (self->content_length < 0) {
         Py_RETURN_NONE;
@@ -1063,13 +1091,13 @@ H1CProtocol_get_content_length(H1CProtocol *self, void *closure)
 }
 
 static PyObject *
-H1CProtocol_get_is_chunked(H1CProtocol *self, void *closure)
+H1CProtocol_get_is_chunked_impl(H1CProtocol *self, void *closure)
 {
     return PyBool_FromLong(self->is_chunked);
 }
 
 static PyObject *
-H1CProtocol_get_should_keep_alive(H1CProtocol *self, void *closure)
+H1CProtocol_get_should_keep_alive_impl(H1CProtocol *self, void *closure)
 {
     if (self->connection_close == 1) {
         Py_RETURN_FALSE;
@@ -1085,20 +1113,20 @@ H1CProtocol_get_should_keep_alive(H1CProtocol *self, void *closure)
 }
 
 static PyObject *
-H1CProtocol_get_should_upgrade(H1CProtocol *self, void *closure)
+H1CProtocol_get_should_upgrade_impl(H1CProtocol *self, void *closure)
 {
     return PyBool_FromLong(self->should_upgrade);
 }
 
 static PyObject *
-H1CProtocol_get_is_complete(H1CProtocol *self, void *closure)
+H1CProtocol_get_is_complete_impl(H1CProtocol *self, void *closure)
 {
     return PyBool_FromLong(self->state == STATE_COMPLETE);
 }
 
 /* get_header method */
 static PyObject *
-H1CProtocol_get_header(H1CProtocol *self, PyObject *args)
+H1CProtocol_get_header_impl(H1CProtocol *self, PyObject *args)
 {
     Py_buffer name_buf;
 
@@ -1144,6 +1172,55 @@ H1CProtocol_get_header(H1CProtocol *self, PyObject *args)
     PyBuffer_Release(&name_buf);
     Py_RETURN_NONE;
 }
+
+/*
+ * H1CProtocol instances are expected to stay on one event-loop thread.
+ * Critical sections still protect their C state against accidental concurrent
+ * access on free-threaded builds.
+ */
+
+#define PICO_LOCKED_PROTOCOL_METHOD(name)                              \
+    static PyObject *                                                 \
+    name(H1CProtocol *self, PyObject *arg)                             \
+    {                                                                 \
+        PyObject *result;                                             \
+        Py_BEGIN_CRITICAL_SECTION((PyObject *)self);                  \
+        result = name##_impl(self, arg);                              \
+        Py_END_CRITICAL_SECTION();                                    \
+        return result;                                                \
+    }
+
+#define PICO_LOCKED_PROTOCOL_GETTER(name)                              \
+    static PyObject *                                                 \
+    name(H1CProtocol *self, void *closure)                             \
+    {                                                                 \
+        PyObject *result;                                             \
+        Py_BEGIN_CRITICAL_SECTION((PyObject *)self);                  \
+        result = name##_impl(self, closure);                          \
+        Py_END_CRITICAL_SECTION();                                    \
+        return result;                                                \
+    }
+
+PICO_LOCKED_PROTOCOL_METHOD(H1CProtocol_feed)
+PICO_LOCKED_PROTOCOL_METHOD(H1CProtocol_finish)
+PICO_LOCKED_PROTOCOL_METHOD(H1CProtocol_reset)
+PICO_LOCKED_PROTOCOL_METHOD(H1CProtocol_get_header)
+PICO_LOCKED_PROTOCOL_METHOD(H1CProtocol_remaining)
+
+PICO_LOCKED_PROTOCOL_GETTER(H1CProtocol_get_method)
+PICO_LOCKED_PROTOCOL_GETTER(H1CProtocol_get_path)
+PICO_LOCKED_PROTOCOL_GETTER(H1CProtocol_get_http_version)
+PICO_LOCKED_PROTOCOL_GETTER(H1CProtocol_get_headers)
+PICO_LOCKED_PROTOCOL_GETTER(H1CProtocol_get_asgi_headers)
+PICO_LOCKED_PROTOCOL_GETTER(H1CProtocol_get_content_length)
+PICO_LOCKED_PROTOCOL_GETTER(H1CProtocol_get_is_chunked)
+PICO_LOCKED_PROTOCOL_GETTER(H1CProtocol_get_should_keep_alive)
+PICO_LOCKED_PROTOCOL_GETTER(H1CProtocol_get_should_upgrade)
+PICO_LOCKED_PROTOCOL_GETTER(H1CProtocol_get_is_complete)
+PICO_LOCKED_PROTOCOL_GETTER(H1CProtocol_get_remaining_truncated)
+
+#undef PICO_LOCKED_PROTOCOL_METHOD
+#undef PICO_LOCKED_PROTOCOL_GETTER
 
 static PyGetSetDef H1CProtocol_getset[] = {
     {"method", (getter)H1CProtocol_get_method, NULL,
@@ -1223,6 +1300,11 @@ PyInit__protocol(void)
     m = PyModule_Create(&protocol_module);
     if (m == NULL)
         return NULL;
+
+    if (pico_module_mark_gil_not_used(m) < 0) {
+        Py_DECREF(m);
+        return NULL;
+    }
 
     Py_INCREF(&H1CProtocolType);
     PyModule_AddObject(m, "H1CProtocol", (PyObject *)&H1CProtocolType);
