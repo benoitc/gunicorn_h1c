@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.9] - 2026-08-23
+
+### Fixed
+
+- Parse the request body on messages that carry an `Upgrade` header. Any
+  `Upgrade` value used to suppress body parsing: the message completed at the
+  end of the headers, `on_body` never fired, and the payload was left in
+  `remaining()` as raw bytes, still chunk-encoded when the request was chunked.
+  An upgrade request is an ordinary HTTP/1.1 request, since the protocol switch
+  happens only after the server answers 101 (RFC 9110 section 7.8) and an h2c
+  client must send any payload in full before its first HTTP/2 frame (RFC 7540
+  section 3.2). On gunicorn's ASGI worker this lost the body silently, and made
+  this parser disagree with the pure-Python one about the same request.
+
+### Changed
+
+- `remaining()` no longer includes the body on those messages. A caller that
+  worked around the old behaviour by taking the declared body off the front of
+  the tail should drop that.
+- An upgrade request with an unterminated chunked body now stays incomplete
+  instead of completing at the headers, exactly as a normal chunked request
+  does.
+
+Messages carrying `Upgrade` that declare no body are unaffected, which covers
+the WebSocket handshake and a bare h2c upgrade. `CONNECT` is unaffected: it has
+no body framing, so everything after its headers stays in `remaining()`.
+
 ## [0.6.8] - 2026-08-20
 
 ### Fixed
