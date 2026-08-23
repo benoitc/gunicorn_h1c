@@ -391,7 +391,10 @@ Notes:
   to report.
 - The tail is measured from the end of the message, not the end of the
   headers. For a body, that means past the last body byte or past the
-  terminating chunk and its trailers.
+  terminating chunk and its trailers. This holds for a request carrying an
+  `Upgrade` header too: its body is parsed and delivered through `on_body`
+  like any other, so the tail starts after it. `CONNECT` is different, since
+  it carries no body and everything after its headers is tunnel traffic.
 - A tail split over several `feed()` calls is accumulated, so you can keep
   feeding until you are ready to read it.
 - `reset()` drops the tail. For pipelining, read it first and feed it back:

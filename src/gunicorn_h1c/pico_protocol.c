@@ -600,8 +600,19 @@ H1CProtocol_feed_headers(H1CProtocol *self)
     self->buffer_len = remaining;
     self->last_len = 0;
 
-    /* Determine body parsing mode */
-    if (skip_body || self->should_upgrade) {
+    /* Determine body parsing mode.
+     *
+     * An Upgrade header does not suppress the body. The protocol switch only
+     * happens once the server answers 101 (RFC 9110 section 7.8), which is
+     * after the request has been read in full, and RFC 7540 section 3.2
+     * requires an h2c client to send any payload in its entirety before its
+     * first HTTP/2 frame. So the bytes after the headers are the request
+     * body, framed by Content-Length or Transfer-Encoding as usual, and
+     * remaining() starts at the end of it.
+     *
+     * CONNECT needs no case of its own: it carries no framing, so it lands in
+     * the no-body branch below and its tunnel bytes stay in remaining(). */
+    if (skip_body) {
         self->state = STATE_COMPLETE;
         H1CProtocol_clamp_tail(self);
         if (self->on_message_complete) {
