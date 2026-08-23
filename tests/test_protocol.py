@@ -974,3 +974,187 @@ class TestH1CProtocolRemainingLimit:
 
         assert p.remaining() == b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
         assert not p.remaining_truncated
+
+
+class TestH1CProtocolUpgradeBody:
+    """An upgrade request is an ordinary request and its body is parsed.
+
+    The protocol switch happens only after the server answers 101 (RFC 9110
+    section 7.8), and RFC 7540 section 3.2 requires an h2c client to send any
+    payload in full before its first HTTP/2 frame. So the bytes after the
+    headers are the request body, framed as on any other request.
+    """
+
+    def probe(self, raw, **kwargs):
+        """Feed raw and return (events, parser)."""
+        events = []
+        p = H1CProtocol(
+            on_headers_complete=lambda: events.append("headers"),
+            on_body=lambda chunk: events.append(("body", chunk)),
+            on_message_complete=lambda: events.append("complete"),
+            **kwargs,
+        )
+        p.feed(raw)
+        return events, p
+
+    def body_of(self, events):
+        return b"".join(c for e, c in (x for x in events if isinstance(x, tuple)))
+
+    def test_content_length_body_is_delivered(self):
+        events, p = self.probe(
+            b"POST / HTTP/1.1\r\nHost: a\r\nUpgrade: h2c\r\n"
+            b"Content-Length: 11\r\n\r\nhello=world"
+        )
+
+        assert self.body_of(events) == b"hello=world"
+        assert events[-1] == "complete"
+        assert p.is_complete
+        assert p.should_upgrade
+        assert p.remaining() == b""
+
+    def test_body_then_pipelined_tail(self):
+        """The tail starts after the body, not after the headers."""
+        preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+        events, p = self.probe(
+            b"POST / HTTP/1.1\r\nHost: a\r\nUpgrade: h2c\r\n"
+            b"Content-Length: 11\r\n\r\nhello=world" + preface
+        )
+
+        assert self.body_of(events) == b"hello=world"
+        assert p.remaining() == preface
+
+    def test_chunked_body_is_dechunked(self):
+        events, p = self.probe(
+            b"POST / HTTP/1.1\r\nHost: a\r\nUpgrade: h2c\r\n"
+            b"Transfer-Encoding: chunked\r\n\r\n"
+            b"b\r\nhello=world\r\n0\r\n\r\n"
+        )
+
+        assert self.body_of(events) == b"hello=world"
+        assert p.is_complete
+        assert p.remaining() == b""
+
+    def test_chunked_body_then_tail(self):
+        events, p = self.probe(
+            b"POST / HTTP/1.1\r\nHost: a\r\nUpgrade: h2c\r\n"
+            b"Transfer-Encoding: chunked\r\n\r\n"
+            b"5\r\nhello\r\n6\r\n=world\r\n0\r\n\r\nAFTER"
+        )
+
+        assert self.body_of(events) == b"hello=world"
+        assert p.remaining() == b"AFTER"
+
+    def test_body_split_across_feeds(self):
+        events = []
+        p = H1CProtocol(on_body=lambda c: events.append(c))
+        p.feed(
+            b"POST / HTTP/1.1\r\nHost: a\r\nUpgrade: h2c\r\nContent-Length: 11\r\n\r\nhel"
+        )
+        assert not p.is_complete
+        p.feed(b"lo=worldAFTER")
+
+        assert b"".join(events) == b"hello=world"
+        assert p.is_complete
+        assert p.remaining() == b"AFTER"
+
+    def test_chunked_body_split_mid_chunk(self):
+        events = []
+        p = H1CProtocol(on_body=lambda c: events.append(c))
+        p.feed(
+            b"POST / HTTP/1.1\r\nHost: a\r\nUpgrade: h2c\r\n"
+            b"Transfer-Encoding: chunked\r\n\r\nb\r\nhel"
+        )
+        assert not p.is_complete
+        p.feed(b"lo=world\r\n0\r\n\r\nAFTER")
+
+        assert b"".join(events) == b"hello=world"
+        assert p.is_complete
+        assert p.remaining() == b"AFTER"
+
+    def test_unterminated_chunked_stays_incomplete(self):
+        """No longer completes at the headers, as any chunked request."""
+        _, p = self.probe(
+            b"POST / HTTP/1.1\r\nHost: a\r\nUpgrade: h2c\r\n"
+            b"Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n"
+        )
+
+        assert not p.is_complete
+
+    def test_no_body_is_unchanged(self):
+        """The WebSocket handshake and a bare h2c upgrade keep working."""
+        preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+        events, p = self.probe(
+            b"GET / HTTP/1.1\r\nHost: a\r\nUpgrade: h2c\r\n\r\n" + preface
+        )
+
+        assert events == ["headers", "complete"]
+        assert p.should_upgrade
+        assert p.remaining() == preface
+
+    def test_content_length_zero_is_unchanged(self):
+        events, p = self.probe(
+            b"POST / HTTP/1.1\r\nHost: a\r\nUpgrade: h2c\r\nContent-Length: 0\r\n\r\nAFTER"
+        )
+
+        assert events == ["headers", "complete"]
+        assert p.remaining() == b"AFTER"
+
+    @pytest.mark.parametrize(
+        "value", [b"h2c", b"websocket", b"bogus"], ids=["h2c", "websocket", "bogus"]
+    )
+    def test_upgrade_value_is_not_special_cased(self, value):
+        events, p = self.probe(
+            b"POST / HTTP/1.1\r\nHost: a\r\nUpgrade: " + value + b"\r\n"
+            b"Content-Length: 11\r\n\r\nhello=world"
+        )
+
+        assert self.body_of(events) == b"hello=world"
+        assert p.remaining() == b""
+
+    def test_connection_upgrade_without_upgrade_header(self):
+        events, p = self.probe(
+            b"POST / HTTP/1.1\r\nHost: a\r\nConnection: upgrade\r\n"
+            b"Content-Length: 11\r\n\r\nhello=world"
+        )
+
+        assert self.body_of(events) == b"hello=world"
+        assert not p.should_upgrade
+        assert p.remaining() == b""
+
+    def test_connect_tunnel_bytes_stay_in_remaining(self):
+        """CONNECT is not an upgrade: everything after the headers is tunnel."""
+        events, p = self.probe(
+            b"CONNECT a:443 HTTP/1.1\r\nHost: a:443\r\n\r\nTUNNELBYTES"
+        )
+
+        assert events == ["headers", "complete"]
+        assert p.remaining() == b"TUNNELBYTES"
+
+    def test_reset_between_pipelined_upgrade_requests(self):
+        events, p = self.probe(
+            b"POST /1 HTTP/1.1\r\nHost: a\r\nUpgrade: h2c\r\n"
+            b"Content-Length: 5\r\n\r\nfirst"
+            b"POST /2 HTTP/1.1\r\nHost: a\r\nContent-Length: 6\r\n\r\nsecond"
+        )
+        assert self.body_of(events) == b"first"
+        assert p.path == b"/1"
+
+        tail = p.remaining()
+        p.reset()
+        p.feed(tail)
+
+        assert p.path == b"/2"
+        assert p.is_complete
+        assert p.remaining() == b""
+
+    def test_large_body_does_not_hit_the_tail_cap(self):
+        """The body is consumed, so only the real tail counts against it."""
+        payload = b"x" * 200000
+        events, p = self.probe(
+            b"POST / HTTP/1.1\r\nHost: a\r\nUpgrade: h2c\r\nContent-Length: 200000\r\n\r\n"
+            + payload
+        )
+
+        assert self.body_of(events) == payload
+        assert not p.remaining_truncated
+        assert p.remaining() == b""
