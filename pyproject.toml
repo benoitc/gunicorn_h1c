@@ -7,14 +7,13 @@ name = "gunicorn_h1c"
 version = "0.6.9"
 description = "Fast HTTP/1.1 parser for Gunicorn using picohttpparser"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 authors = [
     {name = "Benoit Chesneau", email = "benoitc@gunicorn.org"}
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: C",
     "Programming Language :: Python :: 3",
