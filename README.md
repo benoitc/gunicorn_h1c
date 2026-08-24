@@ -13,6 +13,7 @@ Fast HTTP/1.1 parser for Gunicorn using [picohttpparser](https://github.com/h2o/
 - WSGI environ and ASGI scope generation
 - Limit enforcement matching gunicorn's Python parser
 - Specific exception types for validation errors
+- Free-threaded CPython 3.14 support
 - Python 3.9+
 
 ## Installation

@@ -85,25 +85,39 @@ HttpRequest_dealloc(HttpRequest *self)
 static PyObject *
 HttpRequest_get_method(HttpRequest *self, void *closure)
 {
+    PyObject *result = NULL;
+
+    Py_BEGIN_CRITICAL_SECTION((PyObject *)self);
     if (!self->py_method) {
         /* Return bytes directly - avoids memoryview->bytes conversion overhead */
         self->py_method = PyBytes_FromStringAndSize(self->method, self->method_len);
-        if (!self->py_method) return NULL;
+        if (!self->py_method) goto end;
     }
-    Py_INCREF(self->py_method);
-    return self->py_method;
+    result = self->py_method;
+    Py_INCREF(result);
+
+end:;
+    Py_END_CRITICAL_SECTION();
+    return result;
 }
 
 static PyObject *
 HttpRequest_get_path(HttpRequest *self, void *closure)
 {
+    PyObject *result = NULL;
+
+    Py_BEGIN_CRITICAL_SECTION((PyObject *)self);
     if (!self->py_path) {
         /* Return bytes directly - avoids memoryview->bytes conversion overhead */
         self->py_path = PyBytes_FromStringAndSize(self->path, self->path_len);
-        if (!self->py_path) return NULL;
+        if (!self->py_path) goto end;
     }
-    Py_INCREF(self->py_path);
-    return self->py_path;
+    result = self->py_path;
+    Py_INCREF(result);
+
+end:;
+    Py_END_CRITICAL_SECTION();
+    return result;
 }
 
 static PyObject *
@@ -115,47 +129,59 @@ HttpRequest_get_version(HttpRequest *self, void *closure)
 static PyObject *
 HttpRequest_get_headers(HttpRequest *self, void *closure)
 {
+    PyObject *result = NULL;
+
+    Py_BEGIN_CRITICAL_SECTION((PyObject *)self);
     if (!self->py_headers) {
         self->py_headers = PyTuple_New(self->num_headers);
-        if (!self->py_headers) return NULL;
+        if (!self->py_headers) goto end;
 
         for (size_t i = 0; i < self->num_headers; i++) {
             PyObject *pair = pico_create_header_tuple(
                 self->headers[i].name, self->headers[i].name_len,
                 self->headers[i].value, self->headers[i].value_len);
             if (!pair) {
-                Py_DECREF(self->py_headers);
-                self->py_headers = NULL;
-                return NULL;
+                Py_CLEAR(self->py_headers);
+                goto end;
             }
             PyTuple_SET_ITEM(self->py_headers, i, pair);
         }
     }
-    Py_INCREF(self->py_headers);
-    return self->py_headers;
+    result = self->py_headers;
+    Py_INCREF(result);
+
+end:;
+    Py_END_CRITICAL_SECTION();
+    return result;
 }
 
 static PyObject *
 HttpRequest_get_asgi_headers(HttpRequest *self, void *closure)
 {
+    PyObject *result = NULL;
+
+    Py_BEGIN_CRITICAL_SECTION((PyObject *)self);
     if (!self->py_asgi_headers) {
         self->py_asgi_headers = PyList_New(self->num_headers);
-        if (!self->py_asgi_headers) return NULL;
+        if (!self->py_asgi_headers) goto end;
 
         for (size_t i = 0; i < self->num_headers; i++) {
             PyObject *pair = pico_create_header_tuple_lowercase(
                 self->headers[i].name, self->headers[i].name_len,
                 self->headers[i].value, self->headers[i].value_len);
             if (!pair) {
-                Py_DECREF(self->py_asgi_headers);
-                self->py_asgi_headers = NULL;
-                return NULL;
+                Py_CLEAR(self->py_asgi_headers);
+                goto end;
             }
             PyList_SET_ITEM(self->py_asgi_headers, i, pair);
         }
     }
-    Py_INCREF(self->py_asgi_headers);
-    return self->py_asgi_headers;
+    result = self->py_asgi_headers;
+    Py_INCREF(result);
+
+end:;
+    Py_END_CRITICAL_SECTION();
+    return result;
 }
 
 static PyObject *
@@ -508,6 +534,11 @@ PyInit__parser_fast(void)
     m = PyModule_Create(&pico_module);
     if (m == NULL)
         return NULL;
+
+    if (pico_module_mark_gil_not_used(m) < 0) {
+        Py_DECREF(m);
+        return NULL;
+    }
 
     Py_INCREF(&HttpRequestType);
     PyModule_AddObject(m, "HttpRequest", (PyObject *)&HttpRequestType);
