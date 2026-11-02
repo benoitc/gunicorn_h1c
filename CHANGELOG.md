@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- `H1CProtocol` now takes part in cyclic garbage collection. The type did not
+  set `Py_TPFLAGS_HAVE_GC` nor implement `tp_traverse`/`tp_clear`, so the
+  collector could not see the callbacks it holds. A cycle running through a
+  parser, such as an owner that passes its own bound methods as callbacks and
+  keeps the parser as an attribute, was never freed. gunicorn's ASGI worker
+  builds exactly that cycle for every connection, so with `--http-parser fast`
+  each connection leaked its protocol, transport and buffers (about 10 KB)
+  until the worker was recycled or killed (#20).
+
 ## [0.6.9] - 2026-08-23
 
 ### Fixed
