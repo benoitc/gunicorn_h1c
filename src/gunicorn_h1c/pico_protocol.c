@@ -207,20 +207,50 @@ H1CProtocol_keep_tail(H1CProtocol *self, const char *data, size_t len,
     return 0;
 }
 
+/*
+ * GC support. Callers usually pass bound methods of the object that owns the
+ * parser, which makes a reference cycle (owner -> parser -> callback -> owner)
+ * that only the cyclic collector can free.
+ */
+static int
+H1CProtocol_traverse(H1CProtocol *self, visitproc visit, void *arg)
+{
+    Py_VISIT(self->on_message_begin);
+    Py_VISIT(self->on_url);
+    Py_VISIT(self->on_header);
+    Py_VISIT(self->on_headers_complete);
+    Py_VISIT(self->on_body);
+    Py_VISIT(self->on_message_complete);
+
+    Py_VISIT(self->py_method);
+    Py_VISIT(self->py_path);
+    Py_VISIT(self->py_headers);
+    Py_VISIT(self->py_asgi_headers);
+    return 0;
+}
+
+static int
+H1CProtocol_clear(H1CProtocol *self)
+{
+    Py_CLEAR(self->on_message_begin);
+    Py_CLEAR(self->on_url);
+    Py_CLEAR(self->on_header);
+    Py_CLEAR(self->on_headers_complete);
+    Py_CLEAR(self->on_body);
+    Py_CLEAR(self->on_message_complete);
+
+    Py_CLEAR(self->py_method);
+    Py_CLEAR(self->py_path);
+    Py_CLEAR(self->py_headers);
+    Py_CLEAR(self->py_asgi_headers);
+    return 0;
+}
+
 static void
 H1CProtocol_dealloc(H1CProtocol *self)
 {
-    Py_XDECREF(self->on_message_begin);
-    Py_XDECREF(self->on_url);
-    Py_XDECREF(self->on_header);
-    Py_XDECREF(self->on_headers_complete);
-    Py_XDECREF(self->on_body);
-    Py_XDECREF(self->on_message_complete);
-
-    Py_XDECREF(self->py_method);
-    Py_XDECREF(self->py_path);
-    Py_XDECREF(self->py_headers);
-    Py_XDECREF(self->py_asgi_headers);
+    PyObject_GC_UnTrack(self);
+    H1CProtocol_clear(self);
 
     if (self->buffer) {
         PyMem_Free(self->buffer);
@@ -1440,10 +1470,13 @@ static PyTypeObject H1CProtocolType = {
     .tp_doc = "Callback-based HTTP/1.1 parser for asyncio integration",
     .tp_basicsize = sizeof(H1CProtocol),
     .tp_itemsize = 0,
-    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
+    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_GC,
     .tp_new = PyType_GenericNew,
     .tp_init = (initproc)H1CProtocol_init,
     .tp_dealloc = (destructor)H1CProtocol_dealloc,
+    .tp_traverse = (traverseproc)H1CProtocol_traverse,
+    .tp_clear = (inquiry)H1CProtocol_clear,
+    .tp_free = PyObject_GC_Del,
     .tp_getset = H1CProtocol_getset,
     .tp_methods = H1CProtocol_methods,
 };

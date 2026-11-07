@@ -26,6 +26,11 @@ All notable changes to this project will be documented in this file.
   stops at `limit_request_line` or `limit_request_field_size`, and too many
   header lines are refused as soon as they arrive instead of at the end of
   the headers.
+- Free `H1CProtocol` objects caught in a reference cycle. The garbage
+  collector could not see the callbacks a parser holds, so a parser whose
+  callbacks point back to its owner was never freed. gunicorn's ASGI worker
+  builds that cycle on every connection, so with `--http-parser fast` each
+  connection leaked about 10 KB until the worker was restarted (#20).
 
 ### Changed
 

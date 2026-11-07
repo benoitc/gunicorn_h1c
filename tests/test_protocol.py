@@ -1,5 +1,8 @@
 """Tests for H1CProtocol callback-based parser."""
 
+import gc
+import weakref
+
 import pytest
 from gunicorn_h1c._protocol import ParseError as ProtocolParseError
 
@@ -1322,3 +1325,55 @@ class TestH1CProtocolHeaderLineLimits:
         p.reset()
         p.feed(tail)
         assert p.is_complete and p.path == b"/2"
+
+
+class TestH1CProtocolGarbageCollection:
+    """The parser takes part in cyclic garbage collection.
+
+    Callers routinely pass bound methods of the object that owns the parser,
+    which makes a cycle: owner -> parser -> bound method -> owner. gunicorn's
+    ASGI worker does this for every connection.
+    """
+
+    REQUEST = b"GET /path?q=1 HTTP/1.1\r\nHost: example.com\r\nX-A: b\r\n\r\n"
+
+    class Owner:
+        def callback(self, *args):
+            pass
+
+    def owner_collected(self, parser_class=H1CProtocol, data=None):
+        owner = self.Owner()
+        owner.parser = parser_class(
+            on_message_begin=owner.callback,
+            on_url=owner.callback,
+            on_header=owner.callback,
+            on_headers_complete=owner.callback,
+            on_body=owner.callback,
+            on_message_complete=owner.callback,
+        )
+        if data is not None:
+            owner.parser.feed(data)
+        ref = weakref.ref(owner)
+        del owner
+        gc.collect()
+        return ref() is None
+
+    def test_tracked_by_gc(self):
+        assert gc.is_tracked(H1CProtocol())
+
+    def test_cycle_through_callbacks_is_collected(self):
+        assert self.owner_collected()
+
+    def test_cycle_is_collected_after_parsing(self):
+        """Parsed request data held by the parser does not keep it alive."""
+        assert self.owner_collected(data=self.REQUEST)
+
+    def test_cycle_is_collected_mid_request(self):
+        """An incomplete request, cut off before its headers end, does not keep it alive."""
+        assert self.owner_collected(data=self.REQUEST[:20])
+
+    def test_cycle_through_subclass_is_collected(self):
+        class Sub(H1CProtocol):
+            pass
+
+        assert self.owner_collected(parser_class=Sub)
