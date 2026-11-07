@@ -1047,52 +1047,60 @@ PyInit__parser(void)
     PyObject *m = PyModule_Create(&pico_module);
     if (m == NULL) return NULL;
 
+    if (pico_module_mark_gil_not_used(m) < 0) {
+        goto error;
+    }
+
     /* Create base exception types */
     PicoError = PyErr_NewException("gunicorn_h1c._parser.ParseError", PyExc_ValueError, NULL);
-    if (!PicoError) return NULL;
+    if (!PicoError) goto error;
     Py_INCREF(PicoError);
     PyModule_AddObject(m, "ParseError", PicoError);
 
     IncompleteError = PyErr_NewException("gunicorn_h1c._parser.IncompleteError", PyExc_Exception, NULL);
-    if (!IncompleteError) return NULL;
+    if (!IncompleteError) goto error;
     Py_INCREF(IncompleteError);
     PyModule_AddObject(m, "IncompleteError", IncompleteError);
 
     /* Create specific validation exception types (inherit from ParseError) */
     LimitRequestLine = PyErr_NewException("gunicorn_h1c._parser.LimitRequestLine", PicoError, NULL);
-    if (!LimitRequestLine) return NULL;
+    if (!LimitRequestLine) goto error;
     Py_INCREF(LimitRequestLine);
     PyModule_AddObject(m, "LimitRequestLine", LimitRequestLine);
 
     LimitRequestHeaders = PyErr_NewException("gunicorn_h1c._parser.LimitRequestHeaders", PicoError, NULL);
-    if (!LimitRequestHeaders) return NULL;
+    if (!LimitRequestHeaders) goto error;
     Py_INCREF(LimitRequestHeaders);
     PyModule_AddObject(m, "LimitRequestHeaders", LimitRequestHeaders);
 
     InvalidRequestMethod = PyErr_NewException("gunicorn_h1c._parser.InvalidRequestMethod", PicoError, NULL);
-    if (!InvalidRequestMethod) return NULL;
+    if (!InvalidRequestMethod) goto error;
     Py_INCREF(InvalidRequestMethod);
     PyModule_AddObject(m, "InvalidRequestMethod", InvalidRequestMethod);
 
     InvalidHTTPVersion = PyErr_NewException("gunicorn_h1c._parser.InvalidHTTPVersion", PicoError, NULL);
-    if (!InvalidHTTPVersion) return NULL;
+    if (!InvalidHTTPVersion) goto error;
     Py_INCREF(InvalidHTTPVersion);
     PyModule_AddObject(m, "InvalidHTTPVersion", InvalidHTTPVersion);
 
     InvalidHeaderName = PyErr_NewException("gunicorn_h1c._parser.InvalidHeaderName", PicoError, NULL);
-    if (!InvalidHeaderName) return NULL;
+    if (!InvalidHeaderName) goto error;
     Py_INCREF(InvalidHeaderName);
     PyModule_AddObject(m, "InvalidHeaderName", InvalidHeaderName);
 
     InvalidHeader = PyErr_NewException("gunicorn_h1c._parser.InvalidHeader", PicoError, NULL);
-    if (!InvalidHeader) return NULL;
+    if (!InvalidHeader) goto error;
     Py_INCREF(InvalidHeader);
     PyModule_AddObject(m, "InvalidHeader", InvalidHeader);
 
     InvalidChunkExtension = PyErr_NewException("gunicorn_h1c._parser.InvalidChunkExtension", PicoError, NULL);
-    if (!InvalidChunkExtension) return NULL;
+    if (!InvalidChunkExtension) goto error;
     Py_INCREF(InvalidChunkExtension);
     PyModule_AddObject(m, "InvalidChunkExtension", InvalidChunkExtension);
 
     return m;
+
+error:
+    Py_DECREF(m);
+    return NULL;
 }

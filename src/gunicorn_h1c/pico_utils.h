@@ -12,6 +12,34 @@
 #define PICO_UTILS_H
 
 #include <Python.h>
+
+/*
+ * Object critical sections were added in Python 3.13.  They are no-ops on
+ * regular (GIL-enabled) builds, but serialize access to an object's private
+ * C fields on free-threaded builds.  Keep source compatibility with the
+ * Python 3.9 minimum supported by gunicorn_h1c.
+ */
+#ifndef Py_BEGIN_CRITICAL_SECTION
+#  define Py_BEGIN_CRITICAL_SECTION(op) {
+#  define Py_END_CRITICAL_SECTION() }
+#endif
+
+/*
+ * Legacy single-phase extension modules must explicitly opt out of the GIL
+ * on free-threaded CPython.  PyUnstable_Module_SetGIL is only exposed by
+ * free-threaded headers, so this remains a no-op everywhere else.
+ */
+static inline int
+pico_module_mark_gil_not_used(PyObject *module)
+{
+#ifdef Py_GIL_DISABLED
+    return PyUnstable_Module_SetGIL(module, Py_MOD_GIL_NOT_USED);
+#else
+    (void)module;
+    return 0;
+#endif
+}
+
 #include "picohttpparser.h"
 
 /*

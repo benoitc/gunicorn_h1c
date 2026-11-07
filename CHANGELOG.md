@@ -32,6 +32,14 @@ All notable changes to this project will be documented in this file.
   builds that cycle on every connection, so with `--http-parser fast` each
   connection leaked about 10 KB until the worker was restarted (#20).
 
+### Added
+
+- Support for free-threaded CPython (3.14t and later). Importing
+  gunicorn_h1c no longer turns the GIL back on, and the parsers can be used
+  from several threads at once. Each `H1CProtocol` is still meant to be used
+  by one thread at a time. On a free-threaded build, `H1CProtocol.headers`
+  returns a copy of the header list (#16).
+
 ### Changed
 
 - A request that ends a line with a lone LF now raises a parse error (a 400
