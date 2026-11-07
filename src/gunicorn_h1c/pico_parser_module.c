@@ -937,6 +937,12 @@ pico_parse_headers(PyObject *self, PyObject *args, PyObject *kwargs)
 
     PyBuffer_Release(&buf);
 
+    if (ret > 0 && pico_has_obs_fold(headers, num_headers)) {
+        PyErr_SetString(PicoError,
+            "Obsolete line folding is not allowed (RFC 9112 section 5.2)");
+        return NULL;
+    }
+
     if (ret > 0) {
         PyObject *py_headers = PyList_New(num_headers);
         if (!py_headers) return NULL;

@@ -99,3 +99,58 @@ class TestLengthOverflow:
         p.feed(CHUNKED_HEAD + b"00000000000000000000005\r\nhello\r\n0\r\n\r\n")
         assert p.is_complete
         assert body == [b"hello"]
+
+
+class TestObsoleteLineFolding:
+    """A header line starting with SP or HTAB is obsolete line folding.
+
+    RFC 9112 section 5.2: a server must either reject the message or replace
+    each fold with SP. We reject it on every entry point, like gunicorn does
+    unless permit_obsolete_folding is set (which already disables the fast
+    parser in gunicorn).
+    """
+
+    FOLDED = [
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\n ,chunked\r\n"
+        b"Content-Length: 3\r\n\r\nabc",
+        b"GET / HTTP/1.1\r\nHost: a\r\nX-A: 1\r\n\t2\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost: a\r\nX-A: 1\r\n    \r\n\r\n",
+    ]
+
+    ENTRY_POINTS = [
+        "parse_request",
+        "parse_request_fast",
+        "parse_request_raw",
+        "parse_to_wsgi_environ",
+        "parse_to_asgi_scope",
+    ]
+
+    @pytest.mark.parametrize("data", FOLDED)
+    @pytest.mark.parametrize("entry", ENTRY_POINTS)
+    def test_request_parsers_reject_folding(self, entry, data):
+        import gunicorn_h1c
+
+        func = getattr(gunicorn_h1c, entry)
+        with pytest.raises(REJECTED):
+            func(data)
+
+    @pytest.mark.parametrize("data", FOLDED)
+    @pytest.mark.parametrize("bytewise", [False, True], ids=["whole", "bytewise"])
+    def test_protocol_rejects_folding(self, data, bytewise):
+        p = H1CProtocol()
+        step = 1 if bytewise else len(data)
+        with pytest.raises(InvalidHeader, match="folding"):
+            for i in range(0, len(data), step):
+                p.feed(data[i : i + step])
+
+    def test_parse_headers_rejects_folding(self):
+        from gunicorn_h1c import parse_headers
+
+        with pytest.raises(REJECTED):
+            parse_headers(b"Host: a\r\nX-A: 1\r\n 2\r\n\r\n")
+
+    def test_whitespace_inside_a_value_is_fine(self):
+        p = H1CProtocol()
+        p.feed(b"GET / HTTP/1.1\r\nHost: a\r\nX-A: 1 2\t3\r\n\r\n")
+        assert p.is_complete
+        assert p.headers == [(b"Host", b"a"), (b"X-A", b"1 2\t3")]

@@ -810,6 +810,21 @@ pico_validate_header_value(const char *value, size_t value_len,
 }
 
 /*
+ * Return 1 if picohttpparser reported an obsolete line fold: a field with
+ * no name, from a line that starts with SP or HTAB (RFC 9112 section 5.2).
+ */
+static inline int
+pico_has_obs_fold(const struct phr_header *headers, size_t num_headers)
+{
+    for (size_t i = 0; i < num_headers; i++) {
+        if (headers[i].name == NULL || headers[i].name_len == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/*
  * Calculate request line length by finding first CRLF.
  * Returns length or -1 if not found.
  */
@@ -1058,6 +1073,15 @@ pico_validate_headers_full(struct phr_header *headers, size_t num_headers,
             return -1;
         }
 
+        /* RFC 9112 section 5.2: a line starting with SP or HTAB is
+         * obsolete line folding, which picohttpparser reports as a field
+         * with no name. Reject it rather than guess how a proxy unfolds. */
+        if (headers[i].name == NULL || headers[i].name_len == 0) {
+            PyErr_SetString(InvalidHeader,
+                "Obsolete line folding is not allowed (RFC 9112 section 5.2)");
+            return -1;
+        }
+
         /* Validate header name */
         if (pico_validate_header_name(headers[i].name, headers[i].name_len,
                                        InvalidHeaderName) < 0) {
@@ -1107,6 +1131,15 @@ pico_validate_headers(struct phr_header *headers, size_t num_headers,
             PyErr_Format(LimitRequestHeaders,
                 "Header size (%zu) exceeds limit (%zd)",
                 header_size, config->limit_request_field_size);
+            return -1;
+        }
+
+        /* RFC 9112 section 5.2: a line starting with SP or HTAB is
+         * obsolete line folding, which picohttpparser reports as a field
+         * with no name. Reject it rather than guess how a proxy unfolds. */
+        if (headers[i].name == NULL || headers[i].name_len == 0) {
+            PyErr_SetString(InvalidHeader,
+                "Obsolete line folding is not allowed (RFC 9112 section 5.2)");
             return -1;
         }
 

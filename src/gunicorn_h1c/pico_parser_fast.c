@@ -454,6 +454,13 @@ pico_parse_request_raw(PyObject *self, PyObject *args, PyObject *kwargs)
         (size_t)last_len
     );
 
+    if (ret > 0 && pico_has_obs_fold(headers, num_headers)) {
+        PyBuffer_Release(&buf);
+        PyErr_SetString(ParseError,
+            "Obsolete line folding is not allowed (RFC 9112 section 5.2)");
+        return NULL;
+    }
+
     if (ret > 0) {
         /* Calculate offsets relative to buffer start */
         Py_ssize_t method_offset = method - (const char *)buf.buf;
