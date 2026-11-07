@@ -79,6 +79,7 @@ typedef struct {
     int chunked_count;          /* Number of "chunked" values seen */
     int has_te_after_chunked;   /* 1 if T-E value after chunked */
     int has_unknown_te;         /* 1 if unknown Transfer-Encoding value */
+    int te_forces_close;        /* 1 if a compression coding was seen */
     unsigned int singleton_seen; /* Bitmask of pico_singleton_fields seen */
     int duplicate_singleton;    /* Index of first repeated singleton, -1 if none */
 } PicoHeaderInfo;
@@ -117,6 +118,12 @@ pico_parse_content_length(const char *value, size_t value_len)
     for (size_t i = 0; i < value_len; i++) {
         char c = value[i];
         if (c >= '0' && c <= '9') {
+            /* RFC 9110 section 8.6: a value too large to represent is an
+             * error, never wrapped around to a smaller length. */
+            if (cl > PY_SSIZE_T_MAX / 10 ||
+                (cl == PY_SSIZE_T_MAX / 10 && (c - '0') > PY_SSIZE_T_MAX % 10)) {
+                return -1;
+            }
             cl = cl * 10 + (c - '0');
         } else {
             return -1;
@@ -222,6 +229,11 @@ pico_check_te_token(const char *token, size_t token_len)
             buf[4] == 'k' && buf[5] == 'e' && buf[6] == 'd') {
             return 1;  /* chunked */
         }
+        /* "deflate" has the same length, so it is checked here */
+        if (buf[0] == 'd' && buf[1] == 'e' && buf[2] == 'f' && buf[3] == 'l' &&
+            buf[4] == 'a' && buf[5] == 't' && buf[6] == 'e') {
+            return 3;  /* deflate */
+        }
     }
     else if (token_len == 8) {
         /* "identity" */
@@ -251,19 +263,6 @@ pico_check_te_token(const char *token, size_t token_len)
             return 3;  /* gzip */
         }
     }
-    else if (token_len == 7) {
-        /* "deflate" */
-        char buf[7];
-        for (size_t i = 0; i < 7; i++) {
-            buf[i] = token[i];
-            if (buf[i] >= 'A' && buf[i] <= 'Z') buf[i] += 32;
-        }
-        if (buf[0] == 'd' && buf[1] == 'e' && buf[2] == 'f' && buf[3] == 'l' &&
-            buf[4] == 'a' && buf[5] == 't' && buf[6] == 'e') {
-            return 3;  /* deflate */
-        }
-    }
-
     return 0;  /* unknown */
 }
 
@@ -274,11 +273,13 @@ pico_check_te_token(const char *token, size_t token_len)
 static inline void
 pico_parse_transfer_encoding(const char *value, size_t value_len, PicoHeaderInfo *info)
 {
+    /* Split on commas exactly as gunicorn's Python parsers do
+     * (value.split(",")), so an empty value or an empty member, such as
+     * "gzip, " or ",chunked", is an unsupported coding there and here. */
     const char *p = value;
     const char *end = value + value_len;
 
-    while (p < end) {
-        /* Find end of token (comma or end) */
+    while (1) {
         const char *token_start = p;
         const char *token_end = p;
 
@@ -301,22 +302,22 @@ pico_parse_transfer_encoding(const char *value, size_t value_len, PicoHeaderInfo
             if (info->has_chunked) {
                 info->has_te_after_chunked = 1;  /* T-E value after chunked */
             }
-        }
-        else if (te_type == 0 && token_len > 0) {
-            /* Unknown transfer encoding */
-            /* Skip empty tokens */
-            const char *t = token_start;
-            size_t tlen = token_len;
-            while (tlen > 0 && (*t == ' ' || *t == '\t')) { t++; tlen--; }
-            while (tlen > 0 && (t[tlen-1] == ' ' || t[tlen-1] == '\t')) { tlen--; }
-            if (tlen > 0) {
-                info->has_unknown_te = 1;
+            if (te_type == 3) {
+                /* Not decoded here, so the length of the body is unknown:
+                 * close after this message, as gunicorn does, instead of
+                 * reading what follows as another request. */
+                info->te_forces_close = 1;
             }
         }
+        else {
+            /* Unknown or empty transfer coding */
+            info->has_unknown_te = 1;
+        }
 
-        /* Move past comma */
-        p = token_end;
-        if (p < end && *p == ',') p++;
+        if (token_end >= end) {
+            break;
+        }
+        p = token_end + 1;  /* past the comma */
     }
 }
 
@@ -338,6 +339,7 @@ pico_extract_headers(struct phr_header *headers, size_t num_headers,
     info->chunked_count = 0;
     info->has_te_after_chunked = 0;
     info->has_unknown_te = 0;
+    info->te_forces_close = 0;
     info->singleton_seen = 0;
     info->duplicate_singleton = -1;
 
@@ -386,6 +388,11 @@ pico_extract_headers(struct phr_header *headers, size_t num_headers,
         else if (pico_header_name_eq(name, name_len, "upgrade", 7)) {
             info->should_upgrade = 1;
         }
+    }
+
+    /* A compression coding wins over any Connection: keep-alive */
+    if (info->te_forces_close) {
+        info->connection_close = 1;
     }
 }
 
@@ -804,6 +811,49 @@ pico_validate_header_value(const char *value, size_t value_len,
 }
 
 /*
+ * Release the input buffer only once the return value is built: the parsed
+ * fields point into it, and an exporter may move or free that memory when
+ * the view is released.
+ */
+#define PICO_RELEASE_AND_RETURN(bufp, value) \
+    do { \
+        PyObject *pico_ret_ = (PyObject *)(value); \
+        PyBuffer_Release(bufp); \
+        return pico_ret_; \
+    } while (0)
+
+/*
+ * last_len tells picohttpparser how much of the buffer was already seen. It
+ * is used as an offset into the buffer, so it must lie inside it.
+ */
+static inline int
+pico_check_last_len(Py_ssize_t last_len, Py_ssize_t len)
+{
+    if (last_len < 0 || last_len > len) {
+        PyErr_Format(PyExc_ValueError,
+            "last_len must be between 0 and len(data) (%zd), got %zd",
+            len, last_len);
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Return 1 if picohttpparser reported an obsolete line fold: a field with
+ * no name, from a line that starts with SP or HTAB (RFC 9112 section 5.2).
+ */
+static inline int
+pico_has_obs_fold(const struct phr_header *headers, size_t num_headers)
+{
+    for (size_t i = 0; i < num_headers; i++) {
+        if (headers[i].name == NULL || headers[i].name_len == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/*
  * Calculate request line length by finding first CRLF.
  * Returns length or -1 if not found.
  */
@@ -1052,6 +1102,15 @@ pico_validate_headers_full(struct phr_header *headers, size_t num_headers,
             return -1;
         }
 
+        /* RFC 9112 section 5.2: a line starting with SP or HTAB is
+         * obsolete line folding, which picohttpparser reports as a field
+         * with no name. Reject it rather than guess how a proxy unfolds. */
+        if (headers[i].name == NULL || headers[i].name_len == 0) {
+            PyErr_SetString(InvalidHeader,
+                "Obsolete line folding is not allowed (RFC 9112 section 5.2)");
+            return -1;
+        }
+
         /* Validate header name */
         if (pico_validate_header_name(headers[i].name, headers[i].name_len,
                                        InvalidHeaderName) < 0) {
@@ -1101,6 +1160,15 @@ pico_validate_headers(struct phr_header *headers, size_t num_headers,
             PyErr_Format(LimitRequestHeaders,
                 "Header size (%zu) exceeds limit (%zd)",
                 header_size, config->limit_request_field_size);
+            return -1;
+        }
+
+        /* RFC 9112 section 5.2: a line starting with SP or HTAB is
+         * obsolete line folding, which picohttpparser reports as a field
+         * with no name. Reject it rather than guess how a proxy unfolds. */
+        if (headers[i].name == NULL || headers[i].name_len == 0) {
+            PyErr_SetString(InvalidHeader,
+                "Obsolete line folding is not allowed (RFC 9112 section 5.2)");
             return -1;
         }
 

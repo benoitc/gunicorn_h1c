@@ -68,6 +68,11 @@ pico_parse_request(PyObject *self, PyObject *args, PyObject *kwargs)
         return NULL;
     }
 
+    if (pico_check_last_len(last_len, buf.len) < 0) {
+        PyBuffer_Release(&buf);
+        return NULL;
+    }
+
     /* Check request line length before parsing */
     Py_ssize_t req_line_len = pico_find_request_line_length(buf.buf, buf.len);
     if (req_line_len >= 0 && req_line_len > limit_request_line) {
@@ -155,11 +160,9 @@ pico_parse_request(PyObject *self, PyObject *args, PyObject *kwargs)
         return NULL;
     }
 
-    PyBuffer_Release(&buf);
-
     /* Success - build result dict */
     PyObject *result = PyDict_New();
-    if (!result) return NULL;
+    if (!result) PICO_RELEASE_AND_RETURN(&buf, NULL);
 
     PyObject *py_method = PyBytes_FromStringAndSize(method, method_len);
     PyObject *py_path = PyBytes_FromStringAndSize(path, path_len);
@@ -174,7 +177,7 @@ pico_parse_request(PyObject *self, PyObject *args, PyObject *kwargs)
         Py_XDECREF(py_path);
         Py_XDECREF(py_version);
         Py_XDECREF(py_consumed);
-        return NULL;
+        PICO_RELEASE_AND_RETURN(&buf, NULL);
     }
 
     for (size_t i = 0; i < num_headers; i++) {
@@ -188,7 +191,7 @@ pico_parse_request(PyObject *self, PyObject *args, PyObject *kwargs)
             Py_XDECREF(py_path);
             Py_XDECREF(py_version);
             Py_XDECREF(py_consumed);
-            return NULL;
+            PICO_RELEASE_AND_RETURN(&buf, NULL);
         }
         PyList_SET_ITEM(py_headers, i, tuple);
     }
@@ -205,7 +208,7 @@ pico_parse_request(PyObject *self, PyObject *args, PyObject *kwargs)
     Py_DECREF(py_headers);
     Py_DECREF(py_consumed);
 
-    return result;
+    PICO_RELEASE_AND_RETURN(&buf, result);
 }
 
 /*
@@ -220,6 +223,11 @@ pico_parse_response(PyObject *self, PyObject *args, PyObject *kwargs)
 
     if (!PyArg_ParseTupleAndKeywords(args, kwargs, "y*|n", kwlist,
                                      &buf, &last_len)) {
+        return NULL;
+    }
+
+    if (pico_check_last_len(last_len, buf.len) < 0) {
+        PyBuffer_Release(&buf);
         return NULL;
     }
 
@@ -239,11 +247,9 @@ pico_parse_response(PyObject *self, PyObject *args, PyObject *kwargs)
         (size_t)last_len
     );
 
-    PyBuffer_Release(&buf);
-
     if (ret > 0) {
         PyObject *result = PyDict_New();
-        if (!result) return NULL;
+        if (!result) PICO_RELEASE_AND_RETURN(&buf, NULL);
 
         PyObject *py_status = PyLong_FromLong(status);
         PyObject *py_message = PyBytes_FromStringAndSize(msg, msg_len);
@@ -257,7 +263,7 @@ pico_parse_response(PyObject *self, PyObject *args, PyObject *kwargs)
             Py_XDECREF(py_message);
             Py_XDECREF(py_version);
             Py_XDECREF(py_consumed);
-            return NULL;
+            PICO_RELEASE_AND_RETURN(&buf, NULL);
         }
         for (size_t i = 0; i < num_headers; i++) {
             PyObject *tuple = pico_create_header_tuple(
@@ -270,7 +276,7 @@ pico_parse_response(PyObject *self, PyObject *args, PyObject *kwargs)
                 Py_XDECREF(py_message);
                 Py_XDECREF(py_version);
                 Py_XDECREF(py_consumed);
-                return NULL;
+                PICO_RELEASE_AND_RETURN(&buf, NULL);
             }
             PyList_SET_ITEM(py_headers, i, tuple);
         }
@@ -287,15 +293,15 @@ pico_parse_response(PyObject *self, PyObject *args, PyObject *kwargs)
         Py_DECREF(py_headers);
         Py_DECREF(py_consumed);
 
-        return result;
+        PICO_RELEASE_AND_RETURN(&buf, result);
     }
     else if (ret == -2) {
         PyErr_SetString(IncompleteError, "Incomplete response, need more data");
-        return NULL;
+        PICO_RELEASE_AND_RETURN(&buf, NULL);
     }
     else {
         PyErr_SetString(PicoError, "Invalid HTTP response");
-        return NULL;
+        PICO_RELEASE_AND_RETURN(&buf, NULL);
     }
 }
 
@@ -437,11 +443,9 @@ pico_parse_to_wsgi_environ(PyObject *self, PyObject *args, PyObject *kwargs)
         return NULL;
     }
 
-    PyBuffer_Release(&buf);
-
     /* Success - build WSGI environ dict */
     PyObject *environ = PyDict_New();
-    if (!environ) return NULL;
+    if (!environ) PICO_RELEASE_AND_RETURN(&buf, NULL);
 
     /* Split path into PATH_INFO and QUERY_STRING */
     const char *query_start = find_query_string(path, path_len);
@@ -536,61 +540,69 @@ pico_parse_to_wsgi_environ(PyObject *self, PyObject *args, PyObject *kwargs)
         const char *value = headers[i].value;
         size_t value_len = headers[i].value_len;
 
-        /* Build the environ key name */
-        char key_buf[256];
-        size_t key_len = 0;
-        int is_content_type = pico_header_name_eq(name, name_len, "content-type", 12);
-        int is_content_length = pico_header_name_eq(name, name_len, "content-length", 14);
+        /* gunicorn's default header_map = "drop": a name with "_" would
+         * share its environ key with the same name spelled with "-", which
+         * lets a client pass off its own header as one a proxy set. Drop it
+         * so the two can never be merged. */
+        if (memchr(name, '_', name_len)) {
+            continue;
+        }
 
-        if (is_content_type) {
-            memcpy(key_buf, "CONTENT_TYPE", 12);
-            key_len = 12;
-        } else if (is_content_length) {
-            memcpy(key_buf, "CONTENT_LENGTH", 14);
-            key_len = 14;
+        /* Build the environ key at full length, never truncated */
+        PyObject *py_key;
+        if (pico_header_name_eq(name, name_len, "content-type", 12)) {
+            py_key = PyUnicode_FromStringAndSize("CONTENT_TYPE", 12);
+        } else if (pico_header_name_eq(name, name_len, "content-length", 14)) {
+            py_key = PyUnicode_FromStringAndSize("CONTENT_LENGTH", 14);
         } else {
-            /* HTTP_* prefix */
-            memcpy(key_buf, "HTTP_", 5);
-            key_len = 5;
-            /* Copy and transform header name */
-            for (size_t j = 0; j < name_len && key_len < 255; j++) {
-                char c = name[j];
-                if (c >= 'a' && c <= 'z') {
-                    c -= 32;  /* lowercase to uppercase */
-                } else if (c == '-') {
-                    c = '_';  /* dash to underscore */
+            /* HTTP_ prefix, upper case, "-" to "_". Names are tokens, so
+             * ASCII. */
+            py_key = PyUnicode_New((Py_ssize_t)(5 + name_len), 127);
+            if (py_key) {
+                Py_UCS1 *k = PyUnicode_1BYTE_DATA(py_key);
+                memcpy(k, "HTTP_", 5);
+                for (size_t j = 0; j < name_len; j++) {
+                    char c = name[j];
+                    if (c >= 'a' && c <= 'z') {
+                        c -= 32;
+                    } else if (c == '-') {
+                        c = '_';
+                    }
+                    k[5 + j] = (Py_UCS1)c;
                 }
-                key_buf[key_len++] = c;
             }
         }
-        key_buf[key_len] = '\0';
-
-        /* Decode value as latin-1 */
-        PyObject *py_value = PyUnicode_DecodeLatin1(value, value_len, NULL);
-        if (!py_value) {
+        if (!py_key) {
             Py_DECREF(header_dict);
             goto error;
         }
 
-        /* Check if key already exists (duplicate header) */
-        PyObject *existing = PyDict_GetItemString(header_dict, key_buf);
+        /* Decode value as latin-1 */
+        PyObject *py_value = PyUnicode_DecodeLatin1(value, value_len, NULL);
+        if (!py_value) {
+            Py_DECREF(py_key);
+            Py_DECREF(header_dict);
+            goto error;
+        }
+
+        /* Same name twice: join the values with a comma */
+        PyObject *existing = PyDict_GetItemWithError(header_dict, py_key);
+        int rc;
         if (existing) {
-            /* Join with comma */
-            PyObject *comma = PyUnicode_FromString(",");
-            PyObject *joined = PyUnicode_Concat(existing, comma);
-            Py_DECREF(comma);
-            if (joined) {
-                PyObject *final = PyUnicode_Concat(joined, py_value);
-                Py_DECREF(joined);
-                if (final) {
-                    PyDict_SetItemString(header_dict, key_buf, final);
-                    Py_DECREF(final);
-                }
-            }
+            PyObject *joined = PyUnicode_FromFormat("%U,%U", existing, py_value);
+            rc = joined ? PyDict_SetItem(header_dict, py_key, joined) : -1;
+            Py_XDECREF(joined);
+        } else if (PyErr_Occurred()) {
+            rc = -1;
         } else {
-            PyDict_SetItemString(header_dict, key_buf, py_value);
+            rc = PyDict_SetItem(header_dict, py_key, py_value);
         }
         Py_DECREF(py_value);
+        Py_DECREF(py_key);
+        if (rc < 0) {
+            Py_DECREF(header_dict);
+            goto error;
+        }
     }
 
     /* Merge header_dict into environ */
@@ -607,11 +619,11 @@ pico_parse_to_wsgi_environ(PyObject *self, PyObject *args, PyObject *kwargs)
     PyDict_SetItemString(environ, "_consumed", py_consumed);
     Py_DECREF(py_consumed);
 
-    return environ;
+    PICO_RELEASE_AND_RETURN(&buf, environ);
 
 error:
     Py_DECREF(environ);
-    return NULL;
+    PICO_RELEASE_AND_RETURN(&buf, NULL);
 }
 
 /*
@@ -738,11 +750,9 @@ pico_parse_to_asgi_scope(PyObject *self, PyObject *args, PyObject *kwargs)
         return NULL;
     }
 
-    PyBuffer_Release(&buf);
-
     /* Success - build ASGI scope dict */
     PyObject *scope = PyDict_New();
-    if (!scope) return NULL;
+    if (!scope) PICO_RELEASE_AND_RETURN(&buf, NULL);
 
     /* type: "http" */
     PyObject *py_type = PyUnicode_FromString("http");
@@ -904,11 +914,11 @@ pico_parse_to_asgi_scope(PyObject *self, PyObject *args, PyObject *kwargs)
     PyDict_SetItemString(scope, "_consumed", py_consumed);
     Py_DECREF(py_consumed);
 
-    return scope;
+    PICO_RELEASE_AND_RETURN(&buf, scope);
 
 error:
     Py_DECREF(scope);
-    return NULL;
+    PICO_RELEASE_AND_RETURN(&buf, NULL);
 }
 
 /*
@@ -926,6 +936,11 @@ pico_parse_headers(PyObject *self, PyObject *args, PyObject *kwargs)
         return NULL;
     }
 
+    if (pico_check_last_len(last_len, buf.len) < 0) {
+        PyBuffer_Release(&buf);
+        return NULL;
+    }
+
     struct phr_header headers[MAX_HEADERS];
     size_t num_headers = MAX_HEADERS;
 
@@ -935,30 +950,34 @@ pico_parse_headers(PyObject *self, PyObject *args, PyObject *kwargs)
         (size_t)last_len
     );
 
-    PyBuffer_Release(&buf);
+    if (ret > 0 && pico_has_obs_fold(headers, num_headers)) {
+        PyErr_SetString(PicoError,
+            "Obsolete line folding is not allowed (RFC 9112 section 5.2)");
+        PICO_RELEASE_AND_RETURN(&buf, NULL);
+    }
 
     if (ret > 0) {
         PyObject *py_headers = PyList_New(num_headers);
-        if (!py_headers) return NULL;
+        if (!py_headers) PICO_RELEASE_AND_RETURN(&buf, NULL);
         for (size_t i = 0; i < num_headers; i++) {
             PyObject *tuple = pico_create_header_tuple(
                 headers[i].name, headers[i].name_len,
                 headers[i].value, headers[i].value_len);
             if (!tuple) {
                 Py_DECREF(py_headers);
-                return NULL;
+                PICO_RELEASE_AND_RETURN(&buf, NULL);
             }
             PyList_SET_ITEM(py_headers, i, tuple);
         }
-        return py_headers;
+        PICO_RELEASE_AND_RETURN(&buf, py_headers);
     }
     else if (ret == -2) {
         PyErr_SetString(IncompleteError, "Incomplete headers");
-        return NULL;
+        PICO_RELEASE_AND_RETURN(&buf, NULL);
     }
     else {
         PyErr_SetString(PicoError, "Invalid headers");
-        return NULL;
+        PICO_RELEASE_AND_RETURN(&buf, NULL);
     }
 }
 

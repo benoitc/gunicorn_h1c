@@ -4,8 +4,48 @@ All notable changes to this project will be documented in this file.
 
 ## [0.6.10] - 2026-11-07
 
+### Security
+
+These are covered by GHSA-78cg-ph9m-rjjx.
+
+- `H1CProtocol` validates a request in full before it publishes the parsed
+  method, path and headers or runs any callback, and refuses to be re-entered:
+  `feed()`, `reset()` and `finish()` called from a callback raise
+  `RuntimeError`. `get_header()` and `asgi_headers` raise `TypeError` on a
+  header list that no longer holds `(bytes, bytes)` pairs. Before, reading
+  `headers` from a callback or after a rejected request, calling `reset()`
+  from a callback, or changing the list returned by `headers` crashed the
+  interpreter.
+- `parse_request`, `parse_request_fast`, `parse_request_raw`,
+  `parse_response` and `parse_headers` raise `ValueError` unless
+  `0 <= last_len <= len(data)`. An out-of-range `last_len` used to read
+  outside the buffer and could crash the interpreter.
+- `parse_request`, `parse_response`, `parse_headers`, `parse_to_wsgi_environ`
+  and `parse_to_asgi_scope` keep the input buffer until the result is built.
+  They used to release it first and then copy the fields out of it, which is
+  a use after free when the exporter frees that memory on release.
+- `parse_to_wsgi_environ` drops header names containing `_`, like gunicorn's
+  default `header_map = "drop"`, and builds environ keys at full length.
+  `X-Auth-User` and `X_Auth_User` used to share `HTTP_X_AUTH_USER`, with the
+  values joined, so a client could add to a header set by a proxy, and names
+  were cut at 256 bytes.
+
 ### Fixed
 
+- Reject a `Content-Length` or a chunk size too large to represent instead of
+  wrapping it around to a small value (RFC 9110 section 8.6, RFC 9112 section
+  7.1).
+- Reject obsolete line folding, a header line that starts with a space or a
+  tab, on every request entry point (RFC 9112 section 5.2). It used to be
+  kept as a separate field with an empty name.
+- Handle `Transfer-Encoding` as gunicorn's pure-Python parsers do (RFC 9112
+  section 6.1): an empty coding or empty list member is rejected, and `gzip`,
+  `deflate` or `compress` closes the connection after the message instead of
+  reading the body that follows as the next request. `deflate` is now
+  recognised; it used to be rejected as unsupported.
+- Apply `limit_request_field_size` to a complete chunk-size or trailer line,
+  as already done while the line is still arriving (RFC 9112 sections 7.1.1
+  and 7.1.2). The same line is now rejected however its bytes are split.
 - Require CRLF at the end of every line of a request. The parser also
   accepted a lone LF to end the request line and header lines, and let one
   through inside a chunk-size line or a trailer section, so a request that
