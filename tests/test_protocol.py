@@ -1158,3 +1158,92 @@ class TestH1CProtocolUpgradeBody:
         assert self.body_of(events) == payload
         assert not p.remaining_truncated
         assert p.remaining() == b""
+
+
+CHUNKED_HEAD = b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n"
+
+
+def feed_in_pieces(p, data, size=1024):
+    for i in range(0, len(data), size):
+        p.feed(data[i : i + size])
+
+
+class TestH1CProtocolChunkedLineLimits:
+    """A chunk-size line or a trailer line that never gets its CRLF must not
+    be buffered without limit (RFC 9112 sections 7.1, 7.1.1 and 7.1.2).
+
+    Same rule as gunicorn's Python parser: once more than limit + 1 bytes of
+    the line are buffered with no CRLF, the line is rejected (the + 1 leaves
+    room for a CR whose LF is still in flight).
+    """
+
+    def test_unterminated_chunk_size_line_is_rejected(self):
+        p = H1CProtocol()
+        p.feed(CHUNKED_HEAD)
+        with pytest.raises(ProtocolParseError, match="chunk size line"):
+            feed_in_pieces(p, b"1;" + b"a" * 20000)
+
+    def test_chunk_size_line_limit_boundary(self):
+        p = H1CProtocol(limit_request_field_size=100)
+        p.feed(CHUNKED_HEAD)
+        p.feed(b"1;" + b"a" * 98 + b"\r")  # 101 bytes: still waiting
+        assert not p.is_complete
+        with pytest.raises(ProtocolParseError):
+            p.feed(b"a")  # 102 bytes, no CRLF
+
+    def test_chunk_size_line_at_limit_parses(self):
+        body = []
+        p = H1CProtocol(limit_request_field_size=100, on_body=body.append)
+        p.feed(CHUNKED_HEAD)
+        p.feed(b"5;" + b"a" * 98)
+        p.feed(b"\r\nhello\r\n0\r\n\r\n")
+        assert p.is_complete
+        assert body == [b"hello"]
+
+    def test_unterminated_trailer_line_is_rejected(self):
+        p = H1CProtocol()
+        p.feed(CHUNKED_HEAD + b"0\r\n")
+        with pytest.raises(LimitRequestHeaders, match="trailer"):
+            feed_in_pieces(p, b"X-Trailer: " + b"a" * 20000)
+
+    def test_trailer_line_limit_boundary(self):
+        p = H1CProtocol(limit_request_field_size=100)
+        p.feed(CHUNKED_HEAD + b"0\r\n")
+        p.feed(b"X: " + b"a" * 97 + b"\r")  # 101 bytes: still waiting
+        with pytest.raises(LimitRequestHeaders):
+            p.feed(b"a")
+
+    def test_too_many_trailer_lines(self):
+        p = H1CProtocol(limit_request_fields=5)
+        p.feed(CHUNKED_HEAD + b"0\r\n")
+        p.feed(b"X-T: 1\r\n" * 5)
+        with pytest.raises(LimitRequestHeaders, match="trailer"):
+            p.feed(b"X-T: 1\r\n")
+
+    def test_trailer_lines_at_limit_complete(self):
+        p = H1CProtocol(limit_request_fields=5)
+        p.feed(CHUNKED_HEAD + b"0\r\n" + b"X-T: 1\r\n" * 5 + b"\r\n")
+        assert p.is_complete
+
+    def test_trailer_flood_with_default_limit(self):
+        p = H1CProtocol()
+        p.feed(CHUNKED_HEAD + b"0\r\n")
+        with pytest.raises(LimitRequestHeaders):
+            for _ in range(5000):
+                p.feed(b"X-T: 1\r\n")
+
+    def test_trailer_count_resets_between_requests(self):
+        req = CHUNKED_HEAD + b"0\r\n" + b"X-T: 1\r\n" * 5 + b"\r\n"
+        p = H1CProtocol(limit_request_fields=5)
+        for _ in range(3):
+            p.feed(req)
+            assert p.is_complete
+            p.reset()
+
+    def test_bytewise_chunked_request_still_parses(self):
+        body = []
+        p = H1CProtocol(on_body=body.append)
+        data = CHUNKED_HEAD + b"5;x=y\r\nhello\r\n6\r\n world\r\n0\r\nX-T: 1\r\n\r\n"
+        feed_in_pieces(p, data, size=1)
+        assert p.is_complete
+        assert b"".join(body) == b"hello world"

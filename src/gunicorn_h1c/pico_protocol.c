@@ -23,6 +23,12 @@
  * complete, which would otherwise grow without limit. */
 #define PICO_DEFAULT_LIMIT_REMAINING 65536
 
+/* Bounds used for chunk-size and trailer lines when the matching limit is
+ * not positive, so those lines are never unbounded. Same values as
+ * DEFAULT_MAX_FIELD_LINE and DEFAULT_MAX_FIELDS in gunicorn/asgi/parser.py. */
+#define PICO_FALLBACK_MAX_FIELD_LINE 8190
+#define PICO_FALLBACK_MAX_FIELDS 32768
+
 /* Parser states */
 #define STATE_IDLE              0
 #define STATE_HEADERS           1
@@ -91,6 +97,11 @@ typedef struct {
     size_t chunk_size;
     size_t chunk_remaining;
     int skip_body;
+
+    /* Line scanning in the chunked body: where the CRLF search resumes, so
+     * bytes already scanned are not scanned again on the next feed(). */
+    size_t scan_from;
+    Py_ssize_t trailer_count;
 
 } H1CProtocol;
 
@@ -314,6 +325,8 @@ H1CProtocol_init(H1CProtocol *self, PyObject *args, PyObject *kwargs)
     self->chunk_size = 0;
     self->chunk_remaining = 0;
     self->skip_body = 0;
+    self->scan_from = 0;
+    self->trailer_count = 0;
 
     return 0;
 }
@@ -625,6 +638,8 @@ H1CProtocol_feed_headers(H1CProtocol *self)
         self->state = STATE_BODY_CHUNKED_SIZE;
         self->chunk_size = 0;
         self->chunk_remaining = 0;
+        self->scan_from = 0;
+        self->trailer_count = 0;
         if (remaining > 0) {
             return H1CProtocol_feed_body_chunked(self);
         }
@@ -744,6 +759,42 @@ find_crlf(const char *buf, size_t len, size_t from)
     return (Py_ssize_t)(lf - 1 - buf);
 }
 
+/* Length a line may reach before its CRLF arrives. */
+static size_t
+H1CProtocol_line_limit(H1CProtocol *self)
+{
+    if (self->limit_request_field_size > 0) {
+        return (size_t)self->limit_request_field_size;
+    }
+    return PICO_FALLBACK_MAX_FIELD_LINE;
+}
+
+/*
+ * Find the end of the line at the start of the buffer.
+ *
+ * Only bytes not scanned on a previous call are scanned, and a buffer that
+ * can no longer hold a line of at most `limit` bytes plus a pending CR is an
+ * error instead of growing until a terminator arrives. Same rule as
+ * _find_line() in gunicorn/asgi/parser.py.
+ *
+ * Returns the offset of the CR, -1 when more data is needed, -2 on a bare
+ * LF and -3 when the line is too long.
+ */
+static Py_ssize_t
+H1CProtocol_find_line(H1CProtocol *self, size_t limit)
+{
+    Py_ssize_t idx = find_crlf(self->buffer, self->buffer_len, self->scan_from);
+    if (idx == -1) {
+        if (self->buffer_len > limit + 1) {
+            return -3;
+        }
+        self->scan_from = self->buffer_len;
+        return -1;
+    }
+    self->scan_from = 0;
+    return idx;
+}
+
 /*
  * Parse chunked transfer encoding body.
  */
@@ -752,10 +803,19 @@ H1CProtocol_feed_body_chunked(H1CProtocol *self)
 {
     while (1) {
         if (self->state == STATE_BODY_CHUNKED_SIZE) {
-            /* Look for chunk size line (RFC 9112 section 7.1) */
-            Py_ssize_t idx = find_crlf(self->buffer, self->buffer_len, 0);
+            /* Look for chunk size line (RFC 9112 section 7.1). A server
+             * ought to limit the length of chunk extensions (section
+             * 7.1.1); the whole line is bounded by the field size limit. */
+            Py_ssize_t idx = H1CProtocol_find_line(
+                self, H1CProtocol_line_limit(self));
             if (idx == -1) {
                 return 0;  /* Need more data */
+            }
+            if (idx == -3) {
+                PyErr_Format(ParseError,
+                    "chunk size line over %zu bytes with no terminator",
+                    H1CProtocol_line_limit(self));
+                return -1;
             }
             if (idx == -2) {
                 PyErr_SetString(ParseError,
@@ -876,10 +936,18 @@ H1CProtocol_feed_body_chunked(H1CProtocol *self)
         }
         else if (self->state == STATE_BODY_CHUNKED_TRAILER) {
             /* Parse trailers (we just skip them). RFC 9112 section 7.1.2:
-             * trailer-section = *( field-line CRLF ) */
-            Py_ssize_t idx = find_crlf(self->buffer, self->buffer_len, 0);
+             * trailer-section = *( field-line CRLF ). Each line is bounded
+             * like a header line, and their number like the header count. */
+            Py_ssize_t idx = H1CProtocol_find_line(
+                self, H1CProtocol_line_limit(self));
             if (idx == -1) {
                 return 0;  /* Need more data */
+            }
+            if (idx == -3) {
+                PyErr_Format(LimitRequestHeaders,
+                    "Request trailer field over %zu bytes with no terminator",
+                    H1CProtocol_line_limit(self));
+                return -1;
             }
             if (idx == -2) {
                 PyErr_SetString(ParseError,
@@ -906,6 +974,14 @@ H1CProtocol_feed_body_chunked(H1CProtocol *self)
                     Py_DECREF(result);
                 }
                 return 0;
+            }
+
+            Py_ssize_t max_fields = self->limit_request_fields > 0
+                ? self->limit_request_fields : PICO_FALLBACK_MAX_FIELDS;
+            if (++self->trailer_count > max_fields) {
+                PyErr_Format(LimitRequestHeaders,
+                    "Too many trailer fields (limit %zd)", max_fields);
+                return -1;
             }
 
             /* RFC 9110 section 6.5.1: forbid routing/framing/auth fields
@@ -998,6 +1074,8 @@ H1CProtocol_reset(H1CProtocol *self, PyObject *Py_UNUSED(ignored))
     self->buffer_len = 0;
     self->remaining_truncated = 0;
     self->last_len = 0;
+    self->scan_from = 0;
+    self->trailer_count = 0;
 
     Py_XDECREF(self->py_method);
     self->py_method = NULL;
