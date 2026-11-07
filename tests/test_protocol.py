@@ -1,5 +1,8 @@
 """Tests for H1CProtocol callback-based parser."""
 
+import gc
+import weakref
+
 import pytest
 from gunicorn_h1c._protocol import ParseError as ProtocolParseError
 
@@ -1158,3 +1161,219 @@ class TestH1CProtocolUpgradeBody:
         assert self.body_of(events) == payload
         assert not p.remaining_truncated
         assert p.remaining() == b""
+
+
+CHUNKED_HEAD = b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n"
+
+
+def feed_in_pieces(p, data, size=1024):
+    for i in range(0, len(data), size):
+        p.feed(data[i : i + size])
+
+
+class TestH1CProtocolChunkedLineLimits:
+    """A chunk-size line or a trailer line that never gets its CRLF must not
+    be buffered without limit (RFC 9112 sections 7.1, 7.1.1 and 7.1.2).
+
+    Same rule as gunicorn's Python parser: once more than limit + 1 bytes of
+    the line are buffered with no CRLF, the line is rejected (the + 1 leaves
+    room for a CR whose LF is still in flight).
+    """
+
+    def test_unterminated_chunk_size_line_is_rejected(self):
+        p = H1CProtocol()
+        p.feed(CHUNKED_HEAD)
+        with pytest.raises(ProtocolParseError, match="chunk size line"):
+            feed_in_pieces(p, b"1;" + b"a" * 20000)
+
+    def test_chunk_size_line_limit_boundary(self):
+        p = H1CProtocol(limit_request_field_size=100)
+        p.feed(CHUNKED_HEAD)
+        p.feed(b"1;" + b"a" * 98 + b"\r")  # 101 bytes: still waiting
+        assert not p.is_complete
+        with pytest.raises(ProtocolParseError):
+            p.feed(b"a")  # 102 bytes, no CRLF
+
+    def test_chunk_size_line_at_limit_parses(self):
+        body = []
+        p = H1CProtocol(limit_request_field_size=100, on_body=body.append)
+        p.feed(CHUNKED_HEAD)
+        p.feed(b"5;" + b"a" * 98)
+        p.feed(b"\r\nhello\r\n0\r\n\r\n")
+        assert p.is_complete
+        assert body == [b"hello"]
+
+    def test_unterminated_trailer_line_is_rejected(self):
+        p = H1CProtocol()
+        p.feed(CHUNKED_HEAD + b"0\r\n")
+        with pytest.raises(LimitRequestHeaders, match="trailer"):
+            feed_in_pieces(p, b"X-Trailer: " + b"a" * 20000)
+
+    def test_trailer_line_limit_boundary(self):
+        p = H1CProtocol(limit_request_field_size=100)
+        p.feed(CHUNKED_HEAD + b"0\r\n")
+        p.feed(b"X: " + b"a" * 97 + b"\r")  # 101 bytes: still waiting
+        with pytest.raises(LimitRequestHeaders):
+            p.feed(b"a")
+
+    def test_too_many_trailer_lines(self):
+        p = H1CProtocol(limit_request_fields=5)
+        p.feed(CHUNKED_HEAD + b"0\r\n")
+        p.feed(b"X-T: 1\r\n" * 5)
+        with pytest.raises(LimitRequestHeaders, match="trailer"):
+            p.feed(b"X-T: 1\r\n")
+
+    def test_trailer_lines_at_limit_complete(self):
+        p = H1CProtocol(limit_request_fields=5)
+        p.feed(CHUNKED_HEAD + b"0\r\n" + b"X-T: 1\r\n" * 5 + b"\r\n")
+        assert p.is_complete
+
+    def test_trailer_flood_with_default_limit(self):
+        p = H1CProtocol()
+        p.feed(CHUNKED_HEAD + b"0\r\n")
+        with pytest.raises(LimitRequestHeaders):
+            for _ in range(5000):
+                p.feed(b"X-T: 1\r\n")
+
+    def test_trailer_count_resets_between_requests(self):
+        req = CHUNKED_HEAD + b"0\r\n" + b"X-T: 1\r\n" * 5 + b"\r\n"
+        p = H1CProtocol(limit_request_fields=5)
+        for _ in range(3):
+            p.feed(req)
+            assert p.is_complete
+            p.reset()
+
+    def test_bytewise_chunked_request_still_parses(self):
+        body = []
+        p = H1CProtocol(on_body=body.append)
+        data = CHUNKED_HEAD + b"5;x=y\r\nhello\r\n6\r\n world\r\n0\r\nX-T: 1\r\n\r\n"
+        feed_in_pieces(p, data, size=1)
+        assert p.is_complete
+        assert b"".join(body) == b"hello world"
+
+
+class TestH1CProtocolHeaderLineLimits:
+    """A request line or header line that never gets its CRLF must not be
+    buffered without limit (RFC 9112 sections 2.2, 3 and 5).
+
+    Same rule as gunicorn's Python parser: once more than limit + 1 bytes of
+    the line are buffered with no CRLF, the line is rejected.
+    """
+
+    def test_unterminated_request_line_is_rejected(self):
+        p = H1CProtocol()
+        with pytest.raises(LimitRequestLine):
+            feed_in_pieces(p, b"GET /" + b"a" * 20000)
+
+    def test_request_line_limit_boundary(self):
+        p = H1CProtocol(limit_request_line=100)
+        p.feed(b"GET /" + b"a" * 95 + b"\r")  # 101 bytes: still waiting
+        with pytest.raises(LimitRequestLine):
+            p.feed(b"a")
+
+    def test_request_line_at_limit_parses(self):
+        line = b"GET /" + b"a" * 86 + b" HTTP/1.1"  # 100 bytes
+        p = H1CProtocol(limit_request_line=100)
+        feed_in_pieces(p, line + b"\r\nHost: a\r\n\r\n", size=7)
+        assert p.is_complete
+        assert p.path == b"/" + b"a" * 86
+
+    def test_request_line_over_limit_with_crlf(self):
+        line = b"GET /" + b"a" * 87 + b" HTTP/1.1"  # 101 bytes
+        p = H1CProtocol(limit_request_line=100)
+        with pytest.raises(LimitRequestLine):
+            p.feed(line + b"\r\nHost: a\r\n\r\n")
+
+    def test_unterminated_header_line_is_rejected(self):
+        p = H1CProtocol()
+        p.feed(b"GET / HTTP/1.1\r\n")
+        with pytest.raises(LimitRequestHeaders):
+            feed_in_pieces(p, b"X-Big: " + b"a" * 20000)
+
+    def test_header_line_limit_boundary(self):
+        p = H1CProtocol(limit_request_field_size=100)
+        p.feed(b"GET / HTTP/1.1\r\n")
+        p.feed(b"X: " + b"a" * 97 + b"\r")  # 101 bytes: still waiting
+        with pytest.raises(LimitRequestHeaders):
+            p.feed(b"a")
+
+    def test_too_many_header_lines_rejected_before_the_end(self):
+        p = H1CProtocol(limit_request_fields=5)
+        p.feed(b"GET / HTTP/1.1\r\n" + b"X-H: 1\r\n" * 5)
+        with pytest.raises(LimitRequestHeaders):
+            p.feed(b"X-H: 1\r\n")
+
+    def test_header_flood_with_default_limit(self):
+        p = H1CProtocol()
+        p.feed(b"GET / HTTP/1.1\r\n")
+        with pytest.raises(LimitRequestHeaders):
+            for _ in range(5000):
+                p.feed(b"X-H: 1\r\n")
+
+    def test_bytewise_request_with_leading_crlf(self):
+        p = H1CProtocol()
+        feed_in_pieces(p, b"\r\nGET /x HTTP/1.1\r\nHost: a\r\nX: 1\r\n\r\n", size=1)
+        assert p.is_complete
+        assert p.path == b"/x"
+        assert p.headers == [(b"Host", b"a"), (b"X", b"1")]
+
+    def test_pipelined_request_after_reset(self):
+        p = H1CProtocol()
+        p.feed(b"GET /1 HTTP/1.1\r\nHost: a\r\n\r\nGET /2 HTTP/1.1\r\nHost: a\r\n\r\n")
+        assert p.is_complete and p.path == b"/1"
+        tail = p.remaining()
+        p.reset()
+        p.feed(tail)
+        assert p.is_complete and p.path == b"/2"
+
+
+class TestH1CProtocolGarbageCollection:
+    """The parser takes part in cyclic garbage collection.
+
+    Callers routinely pass bound methods of the object that owns the parser,
+    which makes a cycle: owner -> parser -> bound method -> owner. gunicorn's
+    ASGI worker does this for every connection.
+    """
+
+    REQUEST = b"GET /path?q=1 HTTP/1.1\r\nHost: example.com\r\nX-A: b\r\n\r\n"
+
+    class Owner:
+        def callback(self, *args):
+            pass
+
+    def owner_collected(self, parser_class=H1CProtocol, data=None):
+        owner = self.Owner()
+        owner.parser = parser_class(
+            on_message_begin=owner.callback,
+            on_url=owner.callback,
+            on_header=owner.callback,
+            on_headers_complete=owner.callback,
+            on_body=owner.callback,
+            on_message_complete=owner.callback,
+        )
+        if data is not None:
+            owner.parser.feed(data)
+        ref = weakref.ref(owner)
+        del owner
+        gc.collect()
+        return ref() is None
+
+    def test_tracked_by_gc(self):
+        assert gc.is_tracked(H1CProtocol())
+
+    def test_cycle_through_callbacks_is_collected(self):
+        assert self.owner_collected()
+
+    def test_cycle_is_collected_after_parsing(self):
+        """Parsed request data held by the parser does not keep it alive."""
+        assert self.owner_collected(data=self.REQUEST)
+
+    def test_cycle_is_collected_mid_request(self):
+        """An incomplete request, cut off before its headers end, does not keep it alive."""
+        assert self.owner_collected(data=self.REQUEST[:20])
+
+    def test_cycle_through_subclass_is_collected(self):
+        class Sub(H1CProtocol):
+            pass
+
+        assert self.owner_collected(parser_class=Sub)

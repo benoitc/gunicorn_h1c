@@ -2,6 +2,44 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.10] - 2026-11-07
+
+### Fixed
+
+- Require CRLF at the end of every line of a request. The parser also
+  accepted a lone LF to end the request line and header lines, and let one
+  through inside a chunk-size line or a trailer section, so a request that
+  gunicorn's pure-Python parsers reject could be accepted here. RFC 9112
+  section 2.2 lets a server accept a lone LF; gunicorn_h1c no longer does,
+  so all three parsers agree. A lone CR stays invalid. Chunk-size lines and
+  trailers follow the same rule (RFC 9112 sections 7.1 and 7.1.2).
+- Bound the chunk-size line and the trailer section in `H1CProtocol`. A
+  chunk-size line or a trailer line that never ended was buffered without
+  limit, and so was any number of trailer lines. A chunk-size line is now
+  limited by `limit_request_field_size`, each trailer line by
+  `limit_request_field_size` and the number of trailer lines by
+  `limit_request_fields`, as in gunicorn's pure-Python parsers (RFC 9112
+  sections 7.1.1 and 7.1.2). gunicorn answers 400 and 431.
+- Bound the request line and header lines in `H1CProtocol` while they are
+  still arriving. A request line or header line that never ended was
+  buffered without limit, and searching it cost more on each read. It now
+  stops at `limit_request_line` or `limit_request_field_size`, and too many
+  header lines are refused as soon as they arrive instead of at the end of
+  the headers.
+- Free `H1CProtocol` objects caught in a reference cycle. The garbage
+  collector could not see the callbacks a parser holds, so a parser whose
+  callbacks point back to its owner was never freed. gunicorn's ASGI worker
+  builds that cycle on every connection, so with `--http-parser fast` each
+  connection leaked about 10 KB until the worker was restarted (#20).
+
+### Changed
+
+- A request that ends a line with a lone LF now raises a parse error (a 400
+  in gunicorn) on every entry point: `parse_request`, `parse_request_fast`,
+  `parse_request_raw`, `parse_headers`, `parse_to_wsgi_environ`,
+  `parse_to_asgi_scope` and `H1CProtocol`. `parse_response` still accepts a
+  lone LF.
+
 ## [0.6.9] - 2026-08-23
 
 ### Fixed
