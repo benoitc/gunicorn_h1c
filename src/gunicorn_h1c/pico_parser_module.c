@@ -160,11 +160,9 @@ pico_parse_request(PyObject *self, PyObject *args, PyObject *kwargs)
         return NULL;
     }
 
-    PyBuffer_Release(&buf);
-
     /* Success - build result dict */
     PyObject *result = PyDict_New();
-    if (!result) return NULL;
+    if (!result) PICO_RELEASE_AND_RETURN(&buf, NULL);
 
     PyObject *py_method = PyBytes_FromStringAndSize(method, method_len);
     PyObject *py_path = PyBytes_FromStringAndSize(path, path_len);
@@ -179,7 +177,7 @@ pico_parse_request(PyObject *self, PyObject *args, PyObject *kwargs)
         Py_XDECREF(py_path);
         Py_XDECREF(py_version);
         Py_XDECREF(py_consumed);
-        return NULL;
+        PICO_RELEASE_AND_RETURN(&buf, NULL);
     }
 
     for (size_t i = 0; i < num_headers; i++) {
@@ -193,7 +191,7 @@ pico_parse_request(PyObject *self, PyObject *args, PyObject *kwargs)
             Py_XDECREF(py_path);
             Py_XDECREF(py_version);
             Py_XDECREF(py_consumed);
-            return NULL;
+            PICO_RELEASE_AND_RETURN(&buf, NULL);
         }
         PyList_SET_ITEM(py_headers, i, tuple);
     }
@@ -210,7 +208,7 @@ pico_parse_request(PyObject *self, PyObject *args, PyObject *kwargs)
     Py_DECREF(py_headers);
     Py_DECREF(py_consumed);
 
-    return result;
+    PICO_RELEASE_AND_RETURN(&buf, result);
 }
 
 /*
@@ -249,11 +247,9 @@ pico_parse_response(PyObject *self, PyObject *args, PyObject *kwargs)
         (size_t)last_len
     );
 
-    PyBuffer_Release(&buf);
-
     if (ret > 0) {
         PyObject *result = PyDict_New();
-        if (!result) return NULL;
+        if (!result) PICO_RELEASE_AND_RETURN(&buf, NULL);
 
         PyObject *py_status = PyLong_FromLong(status);
         PyObject *py_message = PyBytes_FromStringAndSize(msg, msg_len);
@@ -267,7 +263,7 @@ pico_parse_response(PyObject *self, PyObject *args, PyObject *kwargs)
             Py_XDECREF(py_message);
             Py_XDECREF(py_version);
             Py_XDECREF(py_consumed);
-            return NULL;
+            PICO_RELEASE_AND_RETURN(&buf, NULL);
         }
         for (size_t i = 0; i < num_headers; i++) {
             PyObject *tuple = pico_create_header_tuple(
@@ -280,7 +276,7 @@ pico_parse_response(PyObject *self, PyObject *args, PyObject *kwargs)
                 Py_XDECREF(py_message);
                 Py_XDECREF(py_version);
                 Py_XDECREF(py_consumed);
-                return NULL;
+                PICO_RELEASE_AND_RETURN(&buf, NULL);
             }
             PyList_SET_ITEM(py_headers, i, tuple);
         }
@@ -297,15 +293,15 @@ pico_parse_response(PyObject *self, PyObject *args, PyObject *kwargs)
         Py_DECREF(py_headers);
         Py_DECREF(py_consumed);
 
-        return result;
+        PICO_RELEASE_AND_RETURN(&buf, result);
     }
     else if (ret == -2) {
         PyErr_SetString(IncompleteError, "Incomplete response, need more data");
-        return NULL;
+        PICO_RELEASE_AND_RETURN(&buf, NULL);
     }
     else {
         PyErr_SetString(PicoError, "Invalid HTTP response");
-        return NULL;
+        PICO_RELEASE_AND_RETURN(&buf, NULL);
     }
 }
 
@@ -447,11 +443,9 @@ pico_parse_to_wsgi_environ(PyObject *self, PyObject *args, PyObject *kwargs)
         return NULL;
     }
 
-    PyBuffer_Release(&buf);
-
     /* Success - build WSGI environ dict */
     PyObject *environ = PyDict_New();
-    if (!environ) return NULL;
+    if (!environ) PICO_RELEASE_AND_RETURN(&buf, NULL);
 
     /* Split path into PATH_INFO and QUERY_STRING */
     const char *query_start = find_query_string(path, path_len);
@@ -625,11 +619,11 @@ pico_parse_to_wsgi_environ(PyObject *self, PyObject *args, PyObject *kwargs)
     PyDict_SetItemString(environ, "_consumed", py_consumed);
     Py_DECREF(py_consumed);
 
-    return environ;
+    PICO_RELEASE_AND_RETURN(&buf, environ);
 
 error:
     Py_DECREF(environ);
-    return NULL;
+    PICO_RELEASE_AND_RETURN(&buf, NULL);
 }
 
 /*
@@ -756,11 +750,9 @@ pico_parse_to_asgi_scope(PyObject *self, PyObject *args, PyObject *kwargs)
         return NULL;
     }
 
-    PyBuffer_Release(&buf);
-
     /* Success - build ASGI scope dict */
     PyObject *scope = PyDict_New();
-    if (!scope) return NULL;
+    if (!scope) PICO_RELEASE_AND_RETURN(&buf, NULL);
 
     /* type: "http" */
     PyObject *py_type = PyUnicode_FromString("http");
@@ -922,11 +914,11 @@ pico_parse_to_asgi_scope(PyObject *self, PyObject *args, PyObject *kwargs)
     PyDict_SetItemString(scope, "_consumed", py_consumed);
     Py_DECREF(py_consumed);
 
-    return scope;
+    PICO_RELEASE_AND_RETURN(&buf, scope);
 
 error:
     Py_DECREF(scope);
-    return NULL;
+    PICO_RELEASE_AND_RETURN(&buf, NULL);
 }
 
 /*
@@ -958,36 +950,34 @@ pico_parse_headers(PyObject *self, PyObject *args, PyObject *kwargs)
         (size_t)last_len
     );
 
-    PyBuffer_Release(&buf);
-
     if (ret > 0 && pico_has_obs_fold(headers, num_headers)) {
         PyErr_SetString(PicoError,
             "Obsolete line folding is not allowed (RFC 9112 section 5.2)");
-        return NULL;
+        PICO_RELEASE_AND_RETURN(&buf, NULL);
     }
 
     if (ret > 0) {
         PyObject *py_headers = PyList_New(num_headers);
-        if (!py_headers) return NULL;
+        if (!py_headers) PICO_RELEASE_AND_RETURN(&buf, NULL);
         for (size_t i = 0; i < num_headers; i++) {
             PyObject *tuple = pico_create_header_tuple(
                 headers[i].name, headers[i].name_len,
                 headers[i].value, headers[i].value_len);
             if (!tuple) {
                 Py_DECREF(py_headers);
-                return NULL;
+                PICO_RELEASE_AND_RETURN(&buf, NULL);
             }
             PyList_SET_ITEM(py_headers, i, tuple);
         }
-        return py_headers;
+        PICO_RELEASE_AND_RETURN(&buf, py_headers);
     }
     else if (ret == -2) {
         PyErr_SetString(IncompleteError, "Incomplete headers");
-        return NULL;
+        PICO_RELEASE_AND_RETURN(&buf, NULL);
     }
     else {
         PyErr_SetString(PicoError, "Invalid headers");
-        return NULL;
+        PICO_RELEASE_AND_RETURN(&buf, NULL);
     }
 }
 

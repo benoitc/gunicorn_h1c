@@ -415,3 +415,63 @@ class TestLastLenBounds:
         for last_len in (0, 1, len(data) - 1, len(data)):
             with pytest.raises((gunicorn_h1c.IncompleteError, FastIncomplete)):
                 func(data, last_len=last_len)
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="needs PEP 688")
+class TestInputBufferLifetime:
+    """Parsed fields are copied before the input buffer is released.
+
+    An exporter is free to reuse or free its memory once the view is
+    released; here it overwrites it, so a field copied after the release
+    would come back as Xs.
+    """
+
+    class Scribbler:
+        def __init__(self, data):
+            self.data = bytearray(data)
+
+        def __buffer__(self, flags):
+            return memoryview(self.data)
+
+        def __release_buffer__(self, view):
+            view.release()
+            self.data[:] = b"X" * len(self.data)
+
+    REQUEST = b"GET /path HTTP/1.1\r\nHost: example\r\nX-A: value\r\n\r\n"
+
+    def test_parse_request(self):
+        r = parse_request(self.Scribbler(self.REQUEST))
+        assert r["method"] == b"GET"
+        assert r["path"] == b"/path"
+        assert r["headers"] == [(b"Host", b"example"), (b"X-A", b"value")]
+
+    def test_parse_response(self):
+        from gunicorn_h1c import parse_response
+
+        r = parse_response(self.Scribbler(b"HTTP/1.1 404 Not Found\r\nX-A: v\r\n\r\n"))
+        assert r["message"] == b"Not Found"
+        assert r["headers"] == [(b"X-A", b"v")]
+
+    def test_parse_headers(self):
+        from gunicorn_h1c import parse_headers
+
+        assert parse_headers(self.Scribbler(b"Host: a\r\nX-A: v\r\n\r\n")) == [
+            (b"Host", b"a"),
+            (b"X-A", b"v"),
+        ]
+
+    def test_parse_to_wsgi_environ(self):
+        from gunicorn_h1c import parse_to_wsgi_environ
+
+        env = parse_to_wsgi_environ(self.Scribbler(self.REQUEST))
+        assert env["REQUEST_METHOD"] == "GET"
+        assert env["PATH_INFO"] == "/path"
+        assert env["HTTP_X_A"] == "value"
+
+    def test_parse_to_asgi_scope(self):
+        from gunicorn_h1c import parse_to_asgi_scope
+
+        scope = parse_to_asgi_scope(self.Scribbler(self.REQUEST))
+        assert scope["method"] == "GET"
+        assert scope["path"] == "/path"
+        assert (b"x-a", b"value") in scope["headers"]

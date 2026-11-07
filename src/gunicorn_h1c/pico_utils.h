@@ -811,6 +811,18 @@ pico_validate_header_value(const char *value, size_t value_len,
 }
 
 /*
+ * Release the input buffer only once the return value is built: the parsed
+ * fields point into it, and an exporter may move or free that memory when
+ * the view is released.
+ */
+#define PICO_RELEASE_AND_RETURN(bufp, value) \
+    do { \
+        PyObject *pico_ret_ = (PyObject *)(value); \
+        PyBuffer_Release(bufp); \
+        return pico_ret_; \
+    } while (0)
+
+/*
  * last_len tells picohttpparser how much of the buffer was already seen. It
  * is used as an offset into the buffer, so it must lie inside it.
  */
