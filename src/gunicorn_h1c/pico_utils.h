@@ -798,7 +798,8 @@ pico_find_request_line_length(const char *buf, size_t buf_len)
  * 1. Find method and validate characters
  * 2. Find HTTP version and validate
  * 3. Scan headers for invalid characters
- * 4. Fallback to generic ParseError
+ * 4. Bare LF or bare CR used as a line terminator
+ * 5. Fallback to generic ParseError
  */
 static inline int
 pico_analyze_parse_error(const char *buf, size_t buf_len,
@@ -961,6 +962,30 @@ pico_analyze_parse_error(const char *buf, size_t buf_len,
             }
 
             p = line_end + 2;  /* Skip \r\n */
+        }
+    }
+
+    /* 4. Lines end with CRLF only. RFC 9112 section 2.2 allows a recipient
+     * to accept a bare LF; we do not, and a bare CR is always invalid. Only
+     * the head is checked: the scan stops at the empty line that ends it. */
+    size_t line_start = 0;
+    for (size_t i = 0; i < buf_len; i++) {
+        if (buf[i] == '\n') {
+            if (i == 0 || buf[i - 1] != '\r') {
+                PyErr_SetString(ParseError,
+                    "Bare LF as line terminator, CRLF required "
+                    "(RFC 9112 section 2.2)");
+                return -1;
+            }
+            /* empty line: end of head, unless it is the one leading CRLF */
+            if (i - 1 == line_start && line_start != 0) {
+                break;
+            }
+            line_start = i + 1;
+        } else if (buf[i] == '\r' && i + 1 < buf_len && buf[i + 1] != '\n') {
+            PyErr_SetString(ParseError,
+                "Bare CR in request head (RFC 9112 section 2.2)");
+            return -1;
         }
     }
 

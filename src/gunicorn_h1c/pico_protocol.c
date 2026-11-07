@@ -721,6 +721,30 @@ H1CProtocol_feed_body_content_length(H1CProtocol *self, const char *data,
 }
 
 /*
+ * Find the CRLF ending the line at the start of buf, scanning from `from`.
+ * RFC 9112 section 2.2: lines end with CRLF. A recipient may accept a bare
+ * LF; we do not, so that we agree with gunicorn's pure-Python parsers.
+ *
+ * Returns the offset of the CR, -1 when no line end has arrived yet, or -2
+ * when an LF not preceded by CR was found.
+ */
+static Py_ssize_t
+find_crlf(const char *buf, size_t len, size_t from)
+{
+    if (from >= len) {
+        return -1;
+    }
+    const char *lf = memchr(buf + from, '\n', len - from);
+    if (!lf) {
+        return -1;
+    }
+    if (lf == buf || lf[-1] != '\r') {
+        return -2;
+    }
+    return (Py_ssize_t)(lf - 1 - buf);
+}
+
+/*
  * Parse chunked transfer encoding body.
  */
 static int
@@ -728,13 +752,19 @@ H1CProtocol_feed_body_chunked(H1CProtocol *self)
 {
     while (1) {
         if (self->state == STATE_BODY_CHUNKED_SIZE) {
-            /* Look for chunk size line */
-            char *crlf = memmem(self->buffer, self->buffer_len, "\r\n", 2);
-            if (!crlf) {
+            /* Look for chunk size line (RFC 9112 section 7.1) */
+            Py_ssize_t idx = find_crlf(self->buffer, self->buffer_len, 0);
+            if (idx == -1) {
                 return 0;  /* Need more data */
             }
+            if (idx == -2) {
+                PyErr_SetString(ParseError,
+                    "Bare LF in chunk size line, CRLF required "
+                    "(RFC 9112 section 7.1)");
+                return -1;
+            }
 
-            size_t line_len = crlf - self->buffer;
+            size_t line_len = (size_t)idx;
 
             /* Parse chunk size (may have extensions after ;) */
             char *semicolon = memchr(self->buffer, ';', line_len);
@@ -845,13 +875,25 @@ H1CProtocol_feed_body_chunked(H1CProtocol *self)
             self->state = STATE_BODY_CHUNKED_SIZE;
         }
         else if (self->state == STATE_BODY_CHUNKED_TRAILER) {
-            /* Parse trailers (we just skip them) */
-            char *crlf = memmem(self->buffer, self->buffer_len, "\r\n", 2);
-            if (!crlf) {
+            /* Parse trailers (we just skip them). RFC 9112 section 7.1.2:
+             * trailer-section = *( field-line CRLF ) */
+            Py_ssize_t idx = find_crlf(self->buffer, self->buffer_len, 0);
+            if (idx == -1) {
                 return 0;  /* Need more data */
             }
+            if (idx == -2) {
+                PyErr_SetString(ParseError,
+                    "Bare LF in trailer section, CRLF required "
+                    "(RFC 9112 section 7.1.2)");
+                return -1;
+            }
 
-            size_t line_len = crlf - self->buffer;
+            size_t line_len = (size_t)idx;
+            if (memchr(self->buffer, '\r', line_len)) {
+                PyErr_SetString(ParseError,
+                    "Bare CR in trailer section (RFC 9112 section 2.2)");
+                return -1;
+            }
             if (line_len == 0) {
                 /* Empty line - end of trailers */
                 memmove(self->buffer, self->buffer + 2, self->buffer_len - 2);
