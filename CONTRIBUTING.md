@@ -58,7 +58,8 @@ from gunicorn_h1c import H1CProtocol
 
 p = H1CProtocol()
 p.feed(b"GET / HTTP/1.1\nHost: a\n\n")
-print(p.is_complete)  # 0.6.9 printed True; expected a parse error (RFC 9112 section 2.2)
+# 0.6.9 printed True; expected a parse error (RFC 9112 section 2.2)
+print(p.is_complete)
 ```
 
 ## Security issues and specification bugs
