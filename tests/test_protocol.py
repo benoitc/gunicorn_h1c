@@ -1247,3 +1247,78 @@ class TestH1CProtocolChunkedLineLimits:
         feed_in_pieces(p, data, size=1)
         assert p.is_complete
         assert b"".join(body) == b"hello world"
+
+
+class TestH1CProtocolHeaderLineLimits:
+    """A request line or header line that never gets its CRLF must not be
+    buffered without limit (RFC 9112 sections 2.2, 3 and 5).
+
+    Same rule as gunicorn's Python parser: once more than limit + 1 bytes of
+    the line are buffered with no CRLF, the line is rejected.
+    """
+
+    def test_unterminated_request_line_is_rejected(self):
+        p = H1CProtocol()
+        with pytest.raises(LimitRequestLine):
+            feed_in_pieces(p, b"GET /" + b"a" * 20000)
+
+    def test_request_line_limit_boundary(self):
+        p = H1CProtocol(limit_request_line=100)
+        p.feed(b"GET /" + b"a" * 95 + b"\r")  # 101 bytes: still waiting
+        with pytest.raises(LimitRequestLine):
+            p.feed(b"a")
+
+    def test_request_line_at_limit_parses(self):
+        line = b"GET /" + b"a" * 86 + b" HTTP/1.1"  # 100 bytes
+        p = H1CProtocol(limit_request_line=100)
+        feed_in_pieces(p, line + b"\r\nHost: a\r\n\r\n", size=7)
+        assert p.is_complete
+        assert p.path == b"/" + b"a" * 86
+
+    def test_request_line_over_limit_with_crlf(self):
+        line = b"GET /" + b"a" * 87 + b" HTTP/1.1"  # 101 bytes
+        p = H1CProtocol(limit_request_line=100)
+        with pytest.raises(LimitRequestLine):
+            p.feed(line + b"\r\nHost: a\r\n\r\n")
+
+    def test_unterminated_header_line_is_rejected(self):
+        p = H1CProtocol()
+        p.feed(b"GET / HTTP/1.1\r\n")
+        with pytest.raises(LimitRequestHeaders):
+            feed_in_pieces(p, b"X-Big: " + b"a" * 20000)
+
+    def test_header_line_limit_boundary(self):
+        p = H1CProtocol(limit_request_field_size=100)
+        p.feed(b"GET / HTTP/1.1\r\n")
+        p.feed(b"X: " + b"a" * 97 + b"\r")  # 101 bytes: still waiting
+        with pytest.raises(LimitRequestHeaders):
+            p.feed(b"a")
+
+    def test_too_many_header_lines_rejected_before_the_end(self):
+        p = H1CProtocol(limit_request_fields=5)
+        p.feed(b"GET / HTTP/1.1\r\n" + b"X-H: 1\r\n" * 5)
+        with pytest.raises(LimitRequestHeaders):
+            p.feed(b"X-H: 1\r\n")
+
+    def test_header_flood_with_default_limit(self):
+        p = H1CProtocol()
+        p.feed(b"GET / HTTP/1.1\r\n")
+        with pytest.raises(LimitRequestHeaders):
+            for _ in range(5000):
+                p.feed(b"X-H: 1\r\n")
+
+    def test_bytewise_request_with_leading_crlf(self):
+        p = H1CProtocol()
+        feed_in_pieces(p, b"\r\nGET /x HTTP/1.1\r\nHost: a\r\nX: 1\r\n\r\n", size=1)
+        assert p.is_complete
+        assert p.path == b"/x"
+        assert p.headers == [(b"Host", b"a"), (b"X", b"1")]
+
+    def test_pipelined_request_after_reset(self):
+        p = H1CProtocol()
+        p.feed(b"GET /1 HTTP/1.1\r\nHost: a\r\n\r\nGET /2 HTTP/1.1\r\nHost: a\r\n\r\n")
+        assert p.is_complete and p.path == b"/1"
+        tail = p.remaining()
+        p.reset()
+        p.feed(tail)
+        assert p.is_complete and p.path == b"/2"
