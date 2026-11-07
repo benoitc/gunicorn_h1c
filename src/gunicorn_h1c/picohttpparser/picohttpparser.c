@@ -36,6 +36,14 @@
 #endif
 #include "picohttpparser.h"
 
+/*
+ * gunicorn_h1c: this vendored copy differs from upstream picohttpparser.
+ * Requests and header blocks are parsed in strict mode: every line must end
+ * with CRLF. RFC 9112 section 2.2 lets a recipient accept a bare LF as a line
+ * terminator; we do not, so that this parser accepts the same requests as
+ * gunicorn's pure-Python parsers. Responses keep the upstream leniency.
+ */
+
 #if __GNUC__ >= 3
 #define likely(x) __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
@@ -131,7 +139,8 @@ static const char *findchar_fast(const char *buf, const char *buf_end, const cha
     return buf;
 }
 
-static const char *get_token_to_eol(const char *buf, const char *buf_end, const char **token, size_t *token_len, int *ret)
+static const char *get_token_to_eol(const char *buf, const char *buf_end, const char **token, size_t *token_len, int strict,
+                                    int *ret)
 {
     const char *token_start = buf;
 
@@ -182,7 +191,7 @@ FOUND_CTL:
         ++buf;
         EXPECT_CHAR('\012');
         *token_len = buf - 2 - token_start;
-    } else if (*buf == '\012') {
+    } else if (*buf == '\012' && !strict) {
         *token_len = buf - token_start;
         ++buf;
     } else {
@@ -194,7 +203,7 @@ FOUND_CTL:
     return buf;
 }
 
-static const char *is_complete(const char *buf, const char *buf_end, size_t last_len, int *ret)
+static const char *is_complete(const char *buf, const char *buf_end, size_t last_len, int strict, int *ret)
 {
     int ret_cnt = 0;
     buf = last_len < 3 ? buf : buf + last_len - 3;
@@ -207,6 +216,11 @@ static const char *is_complete(const char *buf, const char *buf_end, size_t last
             EXPECT_CHAR('\012');
             ++ret_cnt;
         } else if (*buf == '\012') {
+            if (strict) {
+                /* Bare LF (or an LF whose CR came before the scan start):
+                 * stop the quick check and let the full parse decide. */
+                return buf;
+            }
             ++buf;
             ++ret_cnt;
         } else {
@@ -296,7 +310,7 @@ static const char *parse_http_version(const char *buf, const char *buf_end, int 
 }
 
 static const char *parse_headers(const char *buf, const char *buf_end, struct phr_header *headers, size_t *num_headers,
-                                 size_t max_headers, int *ret)
+                                 size_t max_headers, int strict, int *ret)
 {
     for (;; ++*num_headers) {
         CHECK_EOF();
@@ -305,6 +319,10 @@ static const char *parse_headers(const char *buf, const char *buf_end, struct ph
             EXPECT_CHAR('\012');
             break;
         } else if (*buf == '\012') {
+            if (strict) {
+                *ret = -1;
+                return NULL;
+            }
             ++buf;
             break;
         }
@@ -335,7 +353,7 @@ static const char *parse_headers(const char *buf, const char *buf_end, struct ph
         }
         const char *value;
         size_t value_len;
-        if ((buf = get_token_to_eol(buf, buf_end, &value, &value_len, ret)) == NULL) {
+        if ((buf = get_token_to_eol(buf, buf_end, &value, &value_len, strict, ret)) == NULL) {
             return NULL;
         }
         /* remove trailing SPs and HTABs */
@@ -356,13 +374,15 @@ static const char *parse_request(const char *buf, const char *buf_end, const cha
                                  size_t *path_len, int *minor_version, struct phr_header *headers, size_t *num_headers,
                                  size_t max_headers, int *ret)
 {
-    /* skip first empty line (some clients add CRLF after POST content) */
+    /* skip first empty line (some clients add CRLF after POST content).
+     * Strict mode: only CRLF, never a bare LF (RFC 9112 section 2.2). */
     CHECK_EOF();
     if (*buf == '\015') {
         ++buf;
         EXPECT_CHAR('\012');
     } else if (*buf == '\012') {
-        ++buf;
+        *ret = -1;
+        return NULL;
     }
 
     /* parse request line */
@@ -385,17 +405,16 @@ static const char *parse_request(const char *buf, const char *buf_end, const cha
     if ((buf = parse_http_version(buf, buf_end, minor_version, ret)) == NULL) {
         return NULL;
     }
+    /* request line ends with CRLF only (RFC 9112 section 2.2) */
     if (*buf == '\015') {
         ++buf;
         EXPECT_CHAR('\012');
-    } else if (*buf == '\012') {
-        ++buf;
     } else {
         *ret = -1;
         return NULL;
     }
 
-    return parse_headers(buf, buf_end, headers, num_headers, max_headers, ret);
+    return parse_headers(buf, buf_end, headers, num_headers, max_headers, 1, ret);
 }
 
 int phr_parse_request(const char *buf_start, size_t len, const char **method, size_t *method_len, const char **path,
@@ -414,7 +433,7 @@ int phr_parse_request(const char *buf_start, size_t len, const char **method, si
 
     /* if last_len != 0, check if the request is complete (a fast countermeasure
        againt slowloris */
-    if (last_len != 0 && is_complete(buf, buf_end, last_len, &r) == NULL) {
+    if (last_len != 0 && is_complete(buf, buf_end, last_len, 1, &r) == NULL) {
         return r;
     }
 
@@ -450,7 +469,7 @@ static const char *parse_response(const char *buf, const char *buf_end, int *min
     PARSE_INT_3(status);
 
     /* get message including preceding space */
-    if ((buf = get_token_to_eol(buf, buf_end, msg, msg_len, ret)) == NULL) {
+    if ((buf = get_token_to_eol(buf, buf_end, msg, msg_len, 0, ret)) == NULL) {
         return NULL;
     }
     if (*msg_len == 0) {
@@ -468,7 +487,7 @@ static const char *parse_response(const char *buf, const char *buf_end, int *min
         return NULL;
     }
 
-    return parse_headers(buf, buf_end, headers, num_headers, max_headers, ret);
+    return parse_headers(buf, buf_end, headers, num_headers, max_headers, 0, ret);
 }
 
 int phr_parse_response(const char *buf_start, size_t len, int *minor_version, int *status, const char **msg, size_t *msg_len,
@@ -486,7 +505,7 @@ int phr_parse_response(const char *buf_start, size_t len, int *minor_version, in
 
     /* if last_len != 0, check if the response is complete (a fast countermeasure
        against slowloris */
-    if (last_len != 0 && is_complete(buf, buf_end, last_len, &r) == NULL) {
+    if (last_len != 0 && is_complete(buf, buf_end, last_len, 0, &r) == NULL) {
         return r;
     }
 
@@ -507,11 +526,11 @@ int phr_parse_headers(const char *buf_start, size_t len, struct phr_header *head
 
     /* if last_len != 0, check if the response is complete (a fast countermeasure
        against slowloris */
-    if (last_len != 0 && is_complete(buf, buf_end, last_len, &r) == NULL) {
+    if (last_len != 0 && is_complete(buf, buf_end, last_len, 1, &r) == NULL) {
         return r;
     }
 
-    if ((buf = parse_headers(buf, buf_end, headers, num_headers, max_headers, &r)) == NULL) {
+    if ((buf = parse_headers(buf, buf_end, headers, num_headers, max_headers, 1, &r)) == NULL) {
         return r;
     }
 

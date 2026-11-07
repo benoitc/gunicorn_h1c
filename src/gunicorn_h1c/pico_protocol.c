@@ -23,6 +23,14 @@
  * complete, which would otherwise grow without limit. */
 #define PICO_DEFAULT_LIMIT_REMAINING 65536
 
+/* Bounds used for chunk-size and trailer lines when the matching limit is
+ * not positive, so those lines are never unbounded. Same values as
+ * DEFAULT_MAX_FIELD_LINE and DEFAULT_MAX_FIELDS in gunicorn/asgi/parser.py. */
+#define PICO_FALLBACK_MAX_FIELD_LINE 8190
+#define PICO_FALLBACK_MAX_FIELDS 32768
+/* Same as MAX_UNLIMITED_REQUEST_LINE in gunicorn/asgi/parser.py */
+#define PICO_FALLBACK_MAX_REQUEST_LINE (1024 * 1024)
+
 /* Parser states */
 #define STATE_IDLE              0
 #define STATE_HEADERS           1
@@ -73,7 +81,14 @@ typedef struct {
     char *buffer;
     size_t buffer_size;
     size_t buffer_len;
-    size_t last_len;
+
+    /* Line scanning in the header phase: where the CRLF search resumes,
+     * where the current line starts, how many header lines were seen, and
+     * whether the request line is done. */
+    size_t hdr_scan;
+    size_t hdr_line_start;
+    Py_ssize_t hdr_lines;
+    int hdr_in_fields;
 
     /* Request data (valid after headers complete) */
     PyObject *py_method;
@@ -91,6 +106,11 @@ typedef struct {
     size_t chunk_size;
     size_t chunk_remaining;
     int skip_body;
+
+    /* Line scanning in the chunked body: where the CRLF search resumes, so
+     * bytes already scanned are not scanned again on the next feed(). */
+    size_t scan_from;
+    Py_ssize_t trailer_count;
 
 } H1CProtocol;
 
@@ -296,7 +316,10 @@ H1CProtocol_init(H1CProtocol *self, PyObject *args, PyObject *kwargs)
     }
     self->buffer_size = INITIAL_BUFFER_SIZE;
     self->buffer_len = 0;
-    self->last_len = 0;
+    self->hdr_scan = 0;
+    self->hdr_line_start = 0;
+    self->hdr_lines = 0;
+    self->hdr_in_fields = 0;
 
     /* Request data */
     self->py_method = NULL;
@@ -314,6 +337,8 @@ H1CProtocol_init(H1CProtocol *self, PyObject *args, PyObject *kwargs)
     self->chunk_size = 0;
     self->chunk_remaining = 0;
     self->skip_body = 0;
+    self->scan_from = 0;
+    self->trailer_count = 0;
 
     return 0;
 }
@@ -421,52 +446,187 @@ H1CProtocol_feed(H1CProtocol *self, PyObject *args)
 }
 
 /*
+ * Find the CRLF ending a line in buf, scanning from `from`.
+ * RFC 9112 section 2.2: lines end with CRLF. A recipient may accept a bare
+ * LF; we do not, so that we agree with gunicorn's pure-Python parsers.
+ *
+ * Returns the offset of the CR, -1 when no line end has arrived yet, or -2
+ * when an LF not preceded by CR was found.
+ */
+static Py_ssize_t
+find_crlf(const char *buf, size_t len, size_t from)
+{
+    if (from >= len) {
+        return -1;
+    }
+    const char *lf = memchr(buf + from, '\n', len - from);
+    if (!lf) {
+        return -1;
+    }
+    if (lf == buf || lf[-1] != '\r') {
+        return -2;
+    }
+    return (Py_ssize_t)(lf - 1 - buf);
+}
+
+/*
  * Parse headers from buffer.
  * Returns 0 on success (or need more data), -1 on error.
  */
+/*
+ * Report a malformed request head with the most specific exception.
+ */
+static int
+H1CProtocol_head_error(H1CProtocol *self)
+{
+    return pico_analyze_parse_error(self->buffer, self->buffer_len,
+                                    self->permit_unconventional_http_method,
+                                    self->permit_unconventional_http_version,
+                                    ParseError,
+                                    InvalidRequestMethod,
+                                    InvalidHTTPVersion,
+                                    InvalidHeaderName,
+                                    InvalidHeader);
+}
+
+/*
+ * Walk the request head line by line as bytes arrive, scanning each byte
+ * once. A line that has not got its CRLF yet is bounded (limit + 1 bytes,
+ * the same rule as _find_line() in gunicorn/asgi/parser.py), and so is the
+ * number of header lines, so a client cannot grow the buffer by never
+ * finishing the head.
+ *
+ * Returns 1 once the empty line ending the head is buffered, 0 when more
+ * data is needed, -1 on error.
+ */
+static int
+H1CProtocol_scan_head(H1CProtocol *self)
+{
+    size_t line_limit = self->limit_request_line > 0
+        ? (size_t)self->limit_request_line : PICO_FALLBACK_MAX_REQUEST_LINE;
+    size_t field_limit = self->limit_request_field_size > 0
+        ? (size_t)self->limit_request_field_size : PICO_FALLBACK_MAX_FIELD_LINE;
+
+    while (1) {
+        Py_ssize_t idx = find_crlf(self->buffer, self->buffer_len,
+                                   self->hdr_scan);
+        if (idx == -2) {
+            /* RFC 9112 section 2.2: CRLF only */
+            return H1CProtocol_head_error(self);
+        }
+
+        if (idx == -1) {
+            size_t pending = self->buffer_len - self->hdr_line_start;
+            if (!self->hdr_in_fields && pending > line_limit + 1) {
+                PyErr_Format(LimitRequestLine,
+                    "Request line over %zu bytes with no terminator",
+                    line_limit);
+                return -1;
+            }
+            if (self->hdr_in_fields && pending > field_limit + 1) {
+                PyErr_Format(LimitRequestHeaders,
+                    "Request header field over %zu bytes with no terminator",
+                    field_limit);
+                return -1;
+            }
+            self->hdr_scan = self->buffer_len;
+            return 0;
+        }
+
+        size_t line_len = (size_t)idx - self->hdr_line_start;
+        size_t next = (size_t)idx + 2;
+        self->hdr_scan = next;
+
+        /* RFC 9112 section 2.2: a bare CR makes the element invalid */
+        if (memchr(self->buffer + self->hdr_line_start, '\r', line_len)) {
+            return H1CProtocol_head_error(self);
+        }
+
+        if (!self->hdr_in_fields) {
+            /* One empty line before the request line is ignored
+             * (RFC 9112 section 2.2), as picohttpparser does. */
+            if (line_len == 0 && self->hdr_line_start == 0) {
+                self->hdr_line_start = next;
+                continue;
+            }
+            if ((Py_ssize_t)line_len > self->limit_request_line) {
+                PyErr_Format(LimitRequestLine,
+                    "Request line length (%zu) exceeds limit (%zd)",
+                    line_len, self->limit_request_line);
+                return -1;
+            }
+            self->hdr_in_fields = 1;
+        } else if (line_len == 0) {
+            return 1;  /* end of the head */
+        } else {
+            self->hdr_lines++;
+            if (self->hdr_lines > self->limit_request_fields) {
+                PyErr_Format(LimitRequestHeaders,
+                    "Number of headers (%zd) exceeds limit (%zd)",
+                    self->hdr_lines, self->limit_request_fields);
+                return -1;
+            }
+        }
+        self->hdr_line_start = next;
+    }
+}
+
 static int
 H1CProtocol_feed_headers(H1CProtocol *self)
 {
-    /* Check request line length before parsing */
-    Py_ssize_t req_line_len = pico_find_request_line_length(self->buffer, self->buffer_len);
-    if (req_line_len >= 0 && req_line_len > self->limit_request_line) {
-        PyErr_Format(LimitRequestLine,
-            "Request line length (%zd) exceeds limit (%zd)",
-            req_line_len, self->limit_request_line);
-        return -1;
-    }
-
     const char *method, *path;
     size_t method_len, path_len;
     int minor_version;
     struct phr_header headers[MAX_HEADERS];
     size_t num_headers = MAX_HEADERS;
+    int ret = -2;
 
-    int ret = phr_parse_request(
-        self->buffer, self->buffer_len,
-        &method, &method_len,
-        &path, &path_len,
-        &minor_version,
-        headers, &num_headers,
-        self->last_len
-    );
-
-    if (ret == -2) {
-        /* Need more data */
-        self->last_len = self->buffer_len;
-        return 0;
+    /* Fast path: the whole head usually arrives in the first feed(). Try a
+     * full parse before scanning; it already rejects bare LF and bare CR.
+     * On anything but success, fall back to the line scanner so limits are
+     * applied in order and an incomplete head stays bounded. */
+    if (self->hdr_scan == 0) {
+        ret = phr_parse_request(
+            self->buffer, self->buffer_len,
+            &method, &method_len,
+            &path, &path_len,
+            &minor_version,
+            headers, &num_headers,
+            0
+        );
+        if (ret > 0) {
+            /* request line: from the method to its CRLF */
+            const char *eol = memchr(path + path_len, '\r',
+                                     self->buffer + ret - (path + path_len));
+            Py_ssize_t line_len = eol ? (Py_ssize_t)(eol - method) : 0;
+            if (line_len > self->limit_request_line) {
+                PyErr_Format(LimitRequestLine,
+                    "Request line length (%zd) exceeds limit (%zd)",
+                    line_len, self->limit_request_line);
+                return -1;
+            }
+        }
     }
 
-    if (ret == -1) {
-        pico_analyze_parse_error(self->buffer, self->buffer_len,
-                                 self->permit_unconventional_http_method,
-                                 self->permit_unconventional_http_version,
-                                 ParseError,
-                                 InvalidRequestMethod,
-                                 InvalidHTTPVersion,
-                                 InvalidHeaderName,
-                                 InvalidHeader);
-        return -1;
+    if (ret <= 0) {
+        int head = H1CProtocol_scan_head(self);
+        if (head <= 0) {
+            return head;
+        }
+
+        num_headers = MAX_HEADERS;
+        ret = phr_parse_request(
+            self->buffer, self->buffer_len,
+            &method, &method_len,
+            &path, &path_len,
+            &minor_version,
+            headers, &num_headers,
+            0
+        );
+        if (ret < 0) {
+            /* The whole head is buffered, so -2 cannot mean "need more" */
+            return H1CProtocol_head_error(self);
+        }
     }
 
     /* Validate method */
@@ -598,7 +758,10 @@ H1CProtocol_feed_headers(H1CProtocol *self)
         memmove(self->buffer, self->buffer + consumed, remaining);
     }
     self->buffer_len = remaining;
-    self->last_len = 0;
+    self->hdr_scan = 0;
+    self->hdr_line_start = 0;
+    self->hdr_lines = 0;
+    self->hdr_in_fields = 0;
 
     /* Determine body parsing mode.
      *
@@ -625,6 +788,8 @@ H1CProtocol_feed_headers(H1CProtocol *self)
         self->state = STATE_BODY_CHUNKED_SIZE;
         self->chunk_size = 0;
         self->chunk_remaining = 0;
+        self->scan_from = 0;
+        self->trailer_count = 0;
         if (remaining > 0) {
             return H1CProtocol_feed_body_chunked(self);
         }
@@ -720,6 +885,42 @@ H1CProtocol_feed_body_content_length(H1CProtocol *self, const char *data,
     return 0;
 }
 
+/* Length a line may reach before its CRLF arrives. */
+static size_t
+H1CProtocol_line_limit(H1CProtocol *self)
+{
+    if (self->limit_request_field_size > 0) {
+        return (size_t)self->limit_request_field_size;
+    }
+    return PICO_FALLBACK_MAX_FIELD_LINE;
+}
+
+/*
+ * Find the end of the line at the start of the buffer.
+ *
+ * Only bytes not scanned on a previous call are scanned, and a buffer that
+ * can no longer hold a line of at most `limit` bytes plus a pending CR is an
+ * error instead of growing until a terminator arrives. Same rule as
+ * _find_line() in gunicorn/asgi/parser.py.
+ *
+ * Returns the offset of the CR, -1 when more data is needed, -2 on a bare
+ * LF and -3 when the line is too long.
+ */
+static Py_ssize_t
+H1CProtocol_find_line(H1CProtocol *self, size_t limit)
+{
+    Py_ssize_t idx = find_crlf(self->buffer, self->buffer_len, self->scan_from);
+    if (idx == -1) {
+        if (self->buffer_len > limit + 1) {
+            return -3;
+        }
+        self->scan_from = self->buffer_len;
+        return -1;
+    }
+    self->scan_from = 0;
+    return idx;
+}
+
 /*
  * Parse chunked transfer encoding body.
  */
@@ -728,13 +929,28 @@ H1CProtocol_feed_body_chunked(H1CProtocol *self)
 {
     while (1) {
         if (self->state == STATE_BODY_CHUNKED_SIZE) {
-            /* Look for chunk size line */
-            char *crlf = memmem(self->buffer, self->buffer_len, "\r\n", 2);
-            if (!crlf) {
+            /* Look for chunk size line (RFC 9112 section 7.1). A server
+             * ought to limit the length of chunk extensions (section
+             * 7.1.1); the whole line is bounded by the field size limit. */
+            Py_ssize_t idx = H1CProtocol_find_line(
+                self, H1CProtocol_line_limit(self));
+            if (idx == -1) {
                 return 0;  /* Need more data */
             }
+            if (idx == -3) {
+                PyErr_Format(ParseError,
+                    "chunk size line over %zu bytes with no terminator",
+                    H1CProtocol_line_limit(self));
+                return -1;
+            }
+            if (idx == -2) {
+                PyErr_SetString(ParseError,
+                    "Bare LF in chunk size line, CRLF required "
+                    "(RFC 9112 section 7.1)");
+                return -1;
+            }
 
-            size_t line_len = crlf - self->buffer;
+            size_t line_len = (size_t)idx;
 
             /* Parse chunk size (may have extensions after ;) */
             char *semicolon = memchr(self->buffer, ';', line_len);
@@ -845,13 +1061,33 @@ H1CProtocol_feed_body_chunked(H1CProtocol *self)
             self->state = STATE_BODY_CHUNKED_SIZE;
         }
         else if (self->state == STATE_BODY_CHUNKED_TRAILER) {
-            /* Parse trailers (we just skip them) */
-            char *crlf = memmem(self->buffer, self->buffer_len, "\r\n", 2);
-            if (!crlf) {
+            /* Parse trailers (we just skip them). RFC 9112 section 7.1.2:
+             * trailer-section = *( field-line CRLF ). Each line is bounded
+             * like a header line, and their number like the header count. */
+            Py_ssize_t idx = H1CProtocol_find_line(
+                self, H1CProtocol_line_limit(self));
+            if (idx == -1) {
                 return 0;  /* Need more data */
             }
+            if (idx == -3) {
+                PyErr_Format(LimitRequestHeaders,
+                    "Request trailer field over %zu bytes with no terminator",
+                    H1CProtocol_line_limit(self));
+                return -1;
+            }
+            if (idx == -2) {
+                PyErr_SetString(ParseError,
+                    "Bare LF in trailer section, CRLF required "
+                    "(RFC 9112 section 7.1.2)");
+                return -1;
+            }
 
-            size_t line_len = crlf - self->buffer;
+            size_t line_len = (size_t)idx;
+            if (memchr(self->buffer, '\r', line_len)) {
+                PyErr_SetString(ParseError,
+                    "Bare CR in trailer section (RFC 9112 section 2.2)");
+                return -1;
+            }
             if (line_len == 0) {
                 /* Empty line - end of trailers */
                 memmove(self->buffer, self->buffer + 2, self->buffer_len - 2);
@@ -864,6 +1100,14 @@ H1CProtocol_feed_body_chunked(H1CProtocol *self)
                     Py_DECREF(result);
                 }
                 return 0;
+            }
+
+            Py_ssize_t max_fields = self->limit_request_fields > 0
+                ? self->limit_request_fields : PICO_FALLBACK_MAX_FIELDS;
+            if (++self->trailer_count > max_fields) {
+                PyErr_Format(LimitRequestHeaders,
+                    "Too many trailer fields (limit %zd)", max_fields);
+                return -1;
             }
 
             /* RFC 9110 section 6.5.1: forbid routing/framing/auth fields
@@ -955,7 +1199,12 @@ H1CProtocol_reset(H1CProtocol *self, PyObject *Py_UNUSED(ignored))
      * reset() so it is parsed as the next message. */
     self->buffer_len = 0;
     self->remaining_truncated = 0;
-    self->last_len = 0;
+    self->hdr_scan = 0;
+    self->hdr_line_start = 0;
+    self->hdr_lines = 0;
+    self->hdr_in_fields = 0;
+    self->scan_from = 0;
+    self->trailer_count = 0;
 
     Py_XDECREF(self->py_method);
     self->py_method = NULL;
