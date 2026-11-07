@@ -154,3 +154,80 @@ class TestObsoleteLineFolding:
         p.feed(b"GET / HTTP/1.1\r\nHost: a\r\nX-A: 1 2\t3\r\n\r\n")
         assert p.is_complete
         assert p.headers == [(b"Host", b"a"), (b"X-A", b"1 2\t3")]
+
+
+def te_request(value, extra=b""):
+    return (
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: "
+        + value
+        + b"\r\n"
+        + extra
+        + b"\r\n"
+    )
+
+
+class TestTransferEncoding:
+    """Transfer-Encoding is handled exactly as gunicorn's Python parsers do
+    (RFC 9112 section 6.1): an empty coding is unsupported, and a compression
+    coding without chunked closes the connection so that its unread body is
+    never parsed as another request."""
+
+    EMPTY = [b"", b" ", b"gzip, ", b",chunked", b"chunked,,", b"gzip,,chunked"]
+
+    @pytest.mark.parametrize("value", EMPTY)
+    def test_empty_coding_is_rejected(self, value):
+        p = H1CProtocol()
+        with pytest.raises(InvalidHeader, match="Transfer-Encoding"):
+            p.feed(te_request(value))
+
+    @pytest.mark.parametrize("value", EMPTY)
+    @pytest.mark.parametrize(
+        "func", [parse_request, parse_request_fast], ids=["parse", "fast"]
+    )
+    def test_parsers_reject_empty_coding(self, func, value):
+        with pytest.raises(REJECTED):
+            func(te_request(value))
+
+    @pytest.mark.parametrize("coding", [b"gzip", b"deflate", b"compress", b"GZIP"])
+    def test_compression_without_chunked_closes(self, coding):
+        p = H1CProtocol()
+        p.feed(te_request(coding) + b"GET /hidden HTTP/1.1\r\nHost: a\r\n\r\n")
+        assert p.is_complete
+        assert not p.should_keep_alive
+
+    @pytest.mark.parametrize("where", ["before", "after"])
+    def test_keep_alive_does_not_override_compression(self, where):
+        keep = b"Connection: keep-alive\r\n"
+        if where == "before":
+            data = (
+                b"POST / HTTP/1.1\r\nHost: a\r\n"
+                + keep
+                + b"Transfer-Encoding: gzip\r\n\r\n"
+            )
+        else:
+            data = te_request(b"gzip", keep)
+        p = H1CProtocol()
+        p.feed(data)
+        assert not p.should_keep_alive
+
+    def test_compression_then_chunked_parses_and_closes(self):
+        body = []
+        p = H1CProtocol(on_body=body.append)
+        p.feed(te_request(b"gzip, chunked") + b"3\r\nabc\r\n0\r\n\r\n")
+        assert p.is_complete
+        assert body == [b"abc"]
+        assert not p.should_keep_alive
+
+    def test_chunked_keeps_alive(self):
+        p = H1CProtocol()
+        p.feed(te_request(b"chunked") + b"0\r\n\r\n")
+        assert p.is_complete
+        assert p.should_keep_alive
+
+    def test_identity_with_content_length_uses_the_length(self):
+        """Same as gunicorn: identity is accepted and Content-Length frames."""
+        body = []
+        p = H1CProtocol(on_body=body.append)
+        p.feed(te_request(b"identity", b"Content-Length: 3\r\n") + b"abc")
+        assert p.is_complete
+        assert body == [b"abc"]

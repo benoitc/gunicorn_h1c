@@ -79,6 +79,7 @@ typedef struct {
     int chunked_count;          /* Number of "chunked" values seen */
     int has_te_after_chunked;   /* 1 if T-E value after chunked */
     int has_unknown_te;         /* 1 if unknown Transfer-Encoding value */
+    int te_forces_close;        /* 1 if a compression coding was seen */
     unsigned int singleton_seen; /* Bitmask of pico_singleton_fields seen */
     int duplicate_singleton;    /* Index of first repeated singleton, -1 if none */
 } PicoHeaderInfo;
@@ -228,6 +229,11 @@ pico_check_te_token(const char *token, size_t token_len)
             buf[4] == 'k' && buf[5] == 'e' && buf[6] == 'd') {
             return 1;  /* chunked */
         }
+        /* "deflate" has the same length, so it is checked here */
+        if (buf[0] == 'd' && buf[1] == 'e' && buf[2] == 'f' && buf[3] == 'l' &&
+            buf[4] == 'a' && buf[5] == 't' && buf[6] == 'e') {
+            return 3;  /* deflate */
+        }
     }
     else if (token_len == 8) {
         /* "identity" */
@@ -257,19 +263,6 @@ pico_check_te_token(const char *token, size_t token_len)
             return 3;  /* gzip */
         }
     }
-    else if (token_len == 7) {
-        /* "deflate" */
-        char buf[7];
-        for (size_t i = 0; i < 7; i++) {
-            buf[i] = token[i];
-            if (buf[i] >= 'A' && buf[i] <= 'Z') buf[i] += 32;
-        }
-        if (buf[0] == 'd' && buf[1] == 'e' && buf[2] == 'f' && buf[3] == 'l' &&
-            buf[4] == 'a' && buf[5] == 't' && buf[6] == 'e') {
-            return 3;  /* deflate */
-        }
-    }
-
     return 0;  /* unknown */
 }
 
@@ -280,11 +273,13 @@ pico_check_te_token(const char *token, size_t token_len)
 static inline void
 pico_parse_transfer_encoding(const char *value, size_t value_len, PicoHeaderInfo *info)
 {
+    /* Split on commas exactly as gunicorn's Python parsers do
+     * (value.split(",")), so an empty value or an empty member, such as
+     * "gzip, " or ",chunked", is an unsupported coding there and here. */
     const char *p = value;
     const char *end = value + value_len;
 
-    while (p < end) {
-        /* Find end of token (comma or end) */
+    while (1) {
         const char *token_start = p;
         const char *token_end = p;
 
@@ -307,22 +302,22 @@ pico_parse_transfer_encoding(const char *value, size_t value_len, PicoHeaderInfo
             if (info->has_chunked) {
                 info->has_te_after_chunked = 1;  /* T-E value after chunked */
             }
-        }
-        else if (te_type == 0 && token_len > 0) {
-            /* Unknown transfer encoding */
-            /* Skip empty tokens */
-            const char *t = token_start;
-            size_t tlen = token_len;
-            while (tlen > 0 && (*t == ' ' || *t == '\t')) { t++; tlen--; }
-            while (tlen > 0 && (t[tlen-1] == ' ' || t[tlen-1] == '\t')) { tlen--; }
-            if (tlen > 0) {
-                info->has_unknown_te = 1;
+            if (te_type == 3) {
+                /* Not decoded here, so the length of the body is unknown:
+                 * close after this message, as gunicorn does, instead of
+                 * reading what follows as another request. */
+                info->te_forces_close = 1;
             }
         }
+        else {
+            /* Unknown or empty transfer coding */
+            info->has_unknown_te = 1;
+        }
 
-        /* Move past comma */
-        p = token_end;
-        if (p < end && *p == ',') p++;
+        if (token_end >= end) {
+            break;
+        }
+        p = token_end + 1;  /* past the comma */
     }
 }
 
@@ -344,6 +339,7 @@ pico_extract_headers(struct phr_header *headers, size_t num_headers,
     info->chunked_count = 0;
     info->has_te_after_chunked = 0;
     info->has_unknown_te = 0;
+    info->te_forces_close = 0;
     info->singleton_seen = 0;
     info->duplicate_singleton = -1;
 
@@ -392,6 +388,11 @@ pico_extract_headers(struct phr_header *headers, size_t num_headers,
         else if (pico_header_name_eq(name, name_len, "upgrade", 7)) {
             info->should_upgrade = 1;
         }
+    }
+
+    /* A compression coding wins over any Connection: keep-alive */
+    if (info->te_forces_close) {
+        info->connection_close = 1;
     }
 }
 
