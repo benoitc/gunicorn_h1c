@@ -6,10 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Security
 
-- Fix HTTP request smuggling in `H1CProtocol`, the parser gunicorn's ASGI
-  worker uses when gunicorn_h1c is installed (GHSA-78cg-ph9m-rjjx). A client
-  could make it frame a request differently from a proxy in front of it and
-  hide a second request inside the first:
+- `H1CProtocol`, the parser gunicorn's ASGI worker uses when gunicorn_h1c is
+  installed, could find the end of a request in a different place than a
+  proxy in front of it, and read the rest of the bytes as a second request
+  (GHSA-78cg-ph9m-rjjx). Three cases are fixed:
   - A `Content-Length` or a chunk size too large for a 64-bit integer wrapped
     around to a small number. Such values are now rejected (RFC 9110 section
     8.6, RFC 9112 section 7.1).
