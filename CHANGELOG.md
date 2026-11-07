@@ -6,6 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Security
 
+These are covered by GHSA-78cg-ph9m-rjjx.
+
 - `H1CProtocol` validates a request in full before it publishes the parsed
   method, path and headers or runs any callback, and refuses to be re-entered:
   `feed()`, `reset()` and `finish()` called from a callback raise
