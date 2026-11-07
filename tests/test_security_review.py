@@ -378,3 +378,40 @@ class TestProtocolCallbackSafety:
         code = textwrap.dedent(self.PRELUDE) + textwrap.dedent(self.CASES[case])
         rc, err = run_isolated(code)
         assert rc == 0, err[-2000:]
+
+
+class TestLastLenBounds:
+    """last_len is an offset into the data, so it must lie inside it."""
+
+    FUNCS = [
+        ("parse_request", b"GET / HTTP/1.1\r\nHost: a\r\n"),
+        ("parse_request_fast", b"GET / HTTP/1.1\r\nHost: a\r\n"),
+        ("parse_request_raw", b"GET / HTTP/1.1\r\nHost: a\r\n"),
+        ("parse_response", b"HTTP/1.1 200 OK\r\nX: 1\r\n"),
+        ("parse_headers", b"Host: a\r\nX: 1\r\n"),
+    ]
+
+    @pytest.mark.parametrize("last_len", [-1, -5, 10**9, 2**62])
+    @pytest.mark.parametrize("name,data", FUNCS, ids=[f[0] for f in FUNCS])
+    def test_out_of_range_last_len_is_refused(self, name, data, last_len):
+        code = f"""
+            import gunicorn_h1c as g
+            try:
+                g.{name}({data!r}, last_len={last_len})
+            except ValueError:
+                raise SystemExit(0)
+            raise SystemExit("no ValueError")
+        """
+        rc, err = run_isolated(code)
+        assert rc == 0, err[-2000:]
+
+    @pytest.mark.parametrize("name,data", FUNCS, ids=[f[0] for f in FUNCS])
+    def test_last_len_up_to_the_length_is_fine(self, name, data):
+        from gunicorn_h1c._parser_fast import IncompleteError as FastIncomplete
+
+        import gunicorn_h1c
+
+        func = getattr(gunicorn_h1c, name)
+        for last_len in (0, 1, len(data) - 1, len(data)):
+            with pytest.raises((gunicorn_h1c.IncompleteError, FastIncomplete)):
+                func(data, last_len=last_len)

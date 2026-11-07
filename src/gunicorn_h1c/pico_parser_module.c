@@ -68,6 +68,11 @@ pico_parse_request(PyObject *self, PyObject *args, PyObject *kwargs)
         return NULL;
     }
 
+    if (pico_check_last_len(last_len, buf.len) < 0) {
+        PyBuffer_Release(&buf);
+        return NULL;
+    }
+
     /* Check request line length before parsing */
     Py_ssize_t req_line_len = pico_find_request_line_length(buf.buf, buf.len);
     if (req_line_len >= 0 && req_line_len > limit_request_line) {
@@ -220,6 +225,11 @@ pico_parse_response(PyObject *self, PyObject *args, PyObject *kwargs)
 
     if (!PyArg_ParseTupleAndKeywords(args, kwargs, "y*|n", kwlist,
                                      &buf, &last_len)) {
+        return NULL;
+    }
+
+    if (pico_check_last_len(last_len, buf.len) < 0) {
+        PyBuffer_Release(&buf);
         return NULL;
     }
 
@@ -931,6 +941,11 @@ pico_parse_headers(PyObject *self, PyObject *args, PyObject *kwargs)
 
     if (!PyArg_ParseTupleAndKeywords(args, kwargs, "y*|n", kwlist,
                                      &buf, &last_len)) {
+        return NULL;
+    }
+
+    if (pico_check_last_len(last_len, buf.len) < 0) {
+        PyBuffer_Release(&buf);
         return NULL;
     }
 

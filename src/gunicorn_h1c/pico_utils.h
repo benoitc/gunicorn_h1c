@@ -811,6 +811,22 @@ pico_validate_header_value(const char *value, size_t value_len,
 }
 
 /*
+ * last_len tells picohttpparser how much of the buffer was already seen. It
+ * is used as an offset into the buffer, so it must lie inside it.
+ */
+static inline int
+pico_check_last_len(Py_ssize_t last_len, Py_ssize_t len)
+{
+    if (last_len < 0 || last_len > len) {
+        PyErr_Format(PyExc_ValueError,
+            "last_len must be between 0 and len(data) (%zd), got %zd",
+            len, last_len);
+        return -1;
+    }
+    return 0;
+}
+
+/*
  * Return 1 if picohttpparser reported an obsolete line fold: a field with
  * no name, from a line that starts with SP or HTAB (RFC 9112 section 5.2).
  */
