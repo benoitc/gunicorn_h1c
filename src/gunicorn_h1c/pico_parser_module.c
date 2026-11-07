@@ -536,61 +536,69 @@ pico_parse_to_wsgi_environ(PyObject *self, PyObject *args, PyObject *kwargs)
         const char *value = headers[i].value;
         size_t value_len = headers[i].value_len;
 
-        /* Build the environ key name */
-        char key_buf[256];
-        size_t key_len = 0;
-        int is_content_type = pico_header_name_eq(name, name_len, "content-type", 12);
-        int is_content_length = pico_header_name_eq(name, name_len, "content-length", 14);
+        /* gunicorn's default header_map = "drop": a name with "_" would
+         * share its environ key with the same name spelled with "-", which
+         * lets a client pass off its own header as one a proxy set. Drop it
+         * so the two can never be merged. */
+        if (memchr(name, '_', name_len)) {
+            continue;
+        }
 
-        if (is_content_type) {
-            memcpy(key_buf, "CONTENT_TYPE", 12);
-            key_len = 12;
-        } else if (is_content_length) {
-            memcpy(key_buf, "CONTENT_LENGTH", 14);
-            key_len = 14;
+        /* Build the environ key at full length, never truncated */
+        PyObject *py_key;
+        if (pico_header_name_eq(name, name_len, "content-type", 12)) {
+            py_key = PyUnicode_FromStringAndSize("CONTENT_TYPE", 12);
+        } else if (pico_header_name_eq(name, name_len, "content-length", 14)) {
+            py_key = PyUnicode_FromStringAndSize("CONTENT_LENGTH", 14);
         } else {
-            /* HTTP_* prefix */
-            memcpy(key_buf, "HTTP_", 5);
-            key_len = 5;
-            /* Copy and transform header name */
-            for (size_t j = 0; j < name_len && key_len < 255; j++) {
-                char c = name[j];
-                if (c >= 'a' && c <= 'z') {
-                    c -= 32;  /* lowercase to uppercase */
-                } else if (c == '-') {
-                    c = '_';  /* dash to underscore */
+            /* HTTP_ prefix, upper case, "-" to "_". Names are tokens, so
+             * ASCII. */
+            py_key = PyUnicode_New((Py_ssize_t)(5 + name_len), 127);
+            if (py_key) {
+                Py_UCS1 *k = PyUnicode_1BYTE_DATA(py_key);
+                memcpy(k, "HTTP_", 5);
+                for (size_t j = 0; j < name_len; j++) {
+                    char c = name[j];
+                    if (c >= 'a' && c <= 'z') {
+                        c -= 32;
+                    } else if (c == '-') {
+                        c = '_';
+                    }
+                    k[5 + j] = (Py_UCS1)c;
                 }
-                key_buf[key_len++] = c;
             }
         }
-        key_buf[key_len] = '\0';
-
-        /* Decode value as latin-1 */
-        PyObject *py_value = PyUnicode_DecodeLatin1(value, value_len, NULL);
-        if (!py_value) {
+        if (!py_key) {
             Py_DECREF(header_dict);
             goto error;
         }
 
-        /* Check if key already exists (duplicate header) */
-        PyObject *existing = PyDict_GetItemString(header_dict, key_buf);
+        /* Decode value as latin-1 */
+        PyObject *py_value = PyUnicode_DecodeLatin1(value, value_len, NULL);
+        if (!py_value) {
+            Py_DECREF(py_key);
+            Py_DECREF(header_dict);
+            goto error;
+        }
+
+        /* Same name twice: join the values with a comma */
+        PyObject *existing = PyDict_GetItemWithError(header_dict, py_key);
+        int rc;
         if (existing) {
-            /* Join with comma */
-            PyObject *comma = PyUnicode_FromString(",");
-            PyObject *joined = PyUnicode_Concat(existing, comma);
-            Py_DECREF(comma);
-            if (joined) {
-                PyObject *final = PyUnicode_Concat(joined, py_value);
-                Py_DECREF(joined);
-                if (final) {
-                    PyDict_SetItemString(header_dict, key_buf, final);
-                    Py_DECREF(final);
-                }
-            }
+            PyObject *joined = PyUnicode_FromFormat("%U,%U", existing, py_value);
+            rc = joined ? PyDict_SetItem(header_dict, py_key, joined) : -1;
+            Py_XDECREF(joined);
+        } else if (PyErr_Occurred()) {
+            rc = -1;
         } else {
-            PyDict_SetItemString(header_dict, key_buf, py_value);
+            rc = PyDict_SetItem(header_dict, py_key, py_value);
         }
         Py_DECREF(py_value);
+        Py_DECREF(py_key);
+        if (rc < 0) {
+            Py_DECREF(header_dict);
+            goto error;
+        }
     }
 
     /* Merge header_dict into environ */

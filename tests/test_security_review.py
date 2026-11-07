@@ -231,3 +231,48 @@ class TestTransferEncoding:
         p.feed(te_request(b"identity", b"Content-Length: 3\r\n") + b"abc")
         assert p.is_complete
         assert body == [b"abc"]
+
+
+class TestWsgiEnvironNames:
+    """parse_to_wsgi_environ must not merge two different header names.
+
+    "X-Auth-User" and "X_Auth_User" both map to HTTP_X_AUTH_USER, so a client
+    could append its own value to one a proxy set. Names with "_" are
+    dropped, like gunicorn's default header_map = "drop".
+    """
+
+    def environ(self, headers):
+        from gunicorn_h1c import parse_to_wsgi_environ
+
+        return parse_to_wsgi_environ(
+            b"GET / HTTP/1.1\r\nHost: a\r\n" + headers + b"\r\n"
+        )
+
+    def test_underscore_name_does_not_merge(self):
+        env = self.environ(b"X-Auth-User: trusted\r\nX_Auth_User: attacker\r\n")
+        assert env["HTTP_X_AUTH_USER"] == "trusted"
+
+    def test_underscore_name_alone_is_dropped(self):
+        env = self.environ(b"X_Auth_User: attacker\r\n")
+        assert "HTTP_X_AUTH_USER" not in env
+
+    def test_underscore_cannot_reach_content_length(self):
+        env = self.environ(b"Content_Length: 5\r\n")
+        assert "CONTENT_LENGTH" not in env
+        assert "HTTP_CONTENT_LENGTH" not in env
+
+    def test_long_names_are_not_truncated(self):
+        a = b"X-" + b"a" * 300 + b"-One"
+        b = b"X-" + b"a" * 300 + b"-Two"
+        env = self.environ(a + b": 1\r\n" + b + b": 2\r\n")
+        assert env["HTTP_X_" + "A" * 300 + "_ONE"] == "1"
+        assert env["HTTP_X_" + "A" * 300 + "_TWO"] == "2"
+
+    def test_repeated_header_is_joined(self):
+        env = self.environ(b"Accept: a\r\nAccept: b\r\n")
+        assert env["HTTP_ACCEPT"] == "a,b"
+
+    def test_content_type_and_host(self):
+        env = self.environ(b"Content-Type: text/plain\r\n")
+        assert env["CONTENT_TYPE"] == "text/plain"
+        assert env["HTTP_HOST"] == "a"
