@@ -475,3 +475,43 @@ class TestInputBufferLifetime:
         assert scope["method"] == "GET"
         assert scope["path"] == "/path"
         assert (b"x-a", b"value") in scope["headers"]
+
+
+class TestCompleteChunkedLineLimits:
+    """A complete chunk-size or trailer line is held to the same limit as one
+    still waiting for its CRLF (RFC 9112 sections 7.1.1 and 7.1.2), so the
+    outcome does not depend on how the bytes were split."""
+
+    @pytest.mark.parametrize("bytewise", [False, True], ids=["whole", "bytewise"])
+    def test_long_chunk_extension_is_rejected(self, bytewise):
+        data = CHUNKED_HEAD + b"5;" + b"a" * 1000 + b"\r\nhello\r\n0\r\n\r\n"
+        p = H1CProtocol(limit_request_field_size=100)
+        step = 1 if bytewise else len(data)
+        with pytest.raises(ProtocolParseError, match="chunk size line"):
+            for i in range(0, len(data), step):
+                p.feed(data[i : i + step])
+
+    @pytest.mark.parametrize("bytewise", [False, True], ids=["whole", "bytewise"])
+    def test_long_trailer_line_is_rejected(self, bytewise):
+        from gunicorn_h1c import LimitRequestHeaders
+
+        data = CHUNKED_HEAD + b"0\r\nX: " + b"b" * 1000 + b"\r\n\r\n"
+        p = H1CProtocol(limit_request_field_size=100)
+        step = 1 if bytewise else len(data)
+        with pytest.raises(LimitRequestHeaders, match="trailer"):
+            for i in range(0, len(data), step):
+                p.feed(data[i : i + step])
+
+    def test_lines_at_the_limit_are_fine(self):
+        body = []
+        p = H1CProtocol(limit_request_field_size=100, on_body=body.append)
+        p.feed(
+            CHUNKED_HEAD
+            + b"5;"
+            + b"a" * 98  # chunk-size line of 100 bytes
+            + b"\r\nhello\r\n0\r\nX: "
+            + b"b" * 95  # trailer line of 98 bytes, 100 with CRLF
+            + b"\r\n\r\n"
+        )
+        assert p.is_complete
+        assert body == [b"hello"]

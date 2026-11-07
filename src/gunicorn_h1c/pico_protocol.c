@@ -999,6 +999,15 @@ H1CProtocol_feed_body_chunked(H1CProtocol *self)
 
             size_t line_len = (size_t)idx;
 
+            /* The same bound applies once the CRLF is there, so whether a
+             * line is accepted does not depend on how the bytes arrived. */
+            if (line_len > H1CProtocol_line_limit(self)) {
+                PyErr_Format(ParseError,
+                    "chunk size line over %zu bytes",
+                    H1CProtocol_line_limit(self));
+                return -1;
+            }
+
             /* Parse chunk size (may have extensions after ;) */
             char *semicolon = memchr(self->buffer, ';', line_len);
             size_t size_len = semicolon ? (size_t)(semicolon - self->buffer) : line_len;
@@ -1136,6 +1145,13 @@ H1CProtocol_feed_body_chunked(H1CProtocol *self)
             }
 
             size_t line_len = (size_t)idx;
+            /* Like a header line: field line plus CRLF within the limit */
+            if (line_len + 2 > H1CProtocol_line_limit(self)) {
+                PyErr_Format(LimitRequestHeaders,
+                    "Request trailer field over %zu bytes",
+                    H1CProtocol_line_limit(self));
+                return -1;
+            }
             if (memchr(self->buffer, '\r', line_len)) {
                 PyErr_SetString(ParseError,
                     "Bare CR in trailer section (RFC 9112 section 2.2)");
