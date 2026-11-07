@@ -117,6 +117,12 @@ pico_parse_content_length(const char *value, size_t value_len)
     for (size_t i = 0; i < value_len; i++) {
         char c = value[i];
         if (c >= '0' && c <= '9') {
+            /* RFC 9110 section 8.6: a value too large to represent is an
+             * error, never wrapped around to a smaller length. */
+            if (cl > PY_SSIZE_T_MAX / 10 ||
+                (cl == PY_SSIZE_T_MAX / 10 && (c - '0') > PY_SSIZE_T_MAX % 10)) {
+                return -1;
+            }
             cl = cl * 10 + (c - '0');
         } else {
             return -1;

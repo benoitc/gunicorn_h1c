@@ -1040,6 +1040,12 @@ H1CProtocol_feed_body_chunked(H1CProtocol *self)
                     PyErr_SetString(ParseError, "Invalid character in chunk size");
                     return -1;
                 }
+                /* RFC 9112 section 7.1: guard against integer overflow
+                 * instead of wrapping to a smaller chunk. */
+                if (chunk_size > (SIZE_MAX >> 4)) {
+                    PyErr_SetString(ParseError, "chunk size too large");
+                    return -1;
+                }
                 chunk_size = chunk_size * 16 + digit;
             }
 
