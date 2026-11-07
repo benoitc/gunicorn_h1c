@@ -276,3 +276,105 @@ class TestWsgiEnvironNames:
         env = self.environ(b"Content-Type: text/plain\r\n")
         assert env["CONTENT_TYPE"] == "text/plain"
         assert env["HTTP_HOST"] == "a"
+
+
+class TestProtocolCallbackSafety:
+    """H1CProtocol must not crash whatever a callback or caller does with it.
+
+    Each case runs in a child interpreter: before the fix they killed it with
+    SIGSEGV or SIGBUS.
+    """
+
+    PRELUDE = """
+        import gunicorn_h1c as g
+        CHUNKED = (b"POST / HTTP/1.1\\r\\nHost: a\\r\\n"
+                   b"Transfer-Encoding: chunked\\r\\n\\r\\n"
+                   b"5\\r\\nhello\\r\\n5\\r\\nworld\\r\\n0\\r\\n\\r\\n")
+        GET = b"GET / HTTP/1.1\\r\\nHost: a\\r\\nX-A: 1\\r\\n\\r\\n"
+        def expect(exc, func):
+            try:
+                func()
+            except exc:
+                return
+            raise SystemExit("no %s raised" % exc.__name__)
+    """
+
+    CASES = {
+        "headers read in on_header": """
+            seen = []
+            def on_header(name, value):
+                seen.append((p.headers, p.asgi_headers, p.get_header(b"host")))
+            p = g.H1CProtocol(on_header=on_header)
+            p.feed(GET)
+            assert p.is_complete and len(seen) == 2
+            assert seen[0][0] == [(b"Host", b"a"), (b"X-A", b"1")]
+            assert seen[0][2] == b"a"
+        """,
+        "reset in on_header": """
+            p = None
+            def on_header(name, value):
+                p.reset()
+            p = g.H1CProtocol(on_header=on_header)
+            expect(RuntimeError, lambda: p.feed(GET))
+        """,
+        "reset in on_body": """
+            p = None
+            p = g.H1CProtocol(on_body=lambda chunk: p.reset())
+            expect(RuntimeError, lambda: p.feed(CHUNKED))
+        """,
+        "feed in on_body": """
+            p = None
+            p = g.H1CProtocol(on_body=lambda chunk: p.feed(b"x" * 100000))
+            expect(RuntimeError, lambda: p.feed(CHUNKED))
+        """,
+        "finish in on_message_complete": """
+            p = None
+            p = g.H1CProtocol(on_message_complete=lambda: p.finish())
+            expect(RuntimeError, lambda: p.feed(GET))
+        """,
+        "reset after callback error still works": """
+            p = None
+            p = g.H1CProtocol(on_header=lambda n, v: p.reset())
+            expect(RuntimeError, lambda: p.feed(GET))
+            p.reset()
+            p2 = g.H1CProtocol()
+            p2.feed(GET)
+            assert p2.is_complete
+        """,
+        "headers after a framing error": """
+            p = g.H1CProtocol()
+            expect(g.InvalidHeader, lambda: p.feed(
+                b"POST / HTTP/1.1\\r\\nHost: a\\r\\n"
+                b"Content-Length: 1\\r\\nContent-Length: 2\\r\\n\\r\\n"))
+            assert p.headers == []
+            assert p.asgi_headers == []
+            assert p.get_header(b"host") is None
+        """,
+        "mutated headers list": """
+            p = g.H1CProtocol()
+            p.feed(GET)
+            h = p.headers
+            h.clear()
+            h.append(1)
+            if h is p.headers:  # GIL build: the list is the parser's own
+                expect(TypeError, lambda: p.asgi_headers)
+                expect(TypeError, lambda: p.get_header(b"host"))
+        """,
+        "headers list shrunk": """
+            p = g.H1CProtocol()
+            p.feed(GET)
+            h = p.headers
+            del h[:]
+            if h is p.headers:  # GIL build: the list is the parser's own
+                assert p.get_header(b"host") is None
+                assert p.asgi_headers == []
+            else:  # free-threaded build: headers is a copy
+                assert p.get_header(b"host") == b"a"
+        """,
+    }
+
+    @pytest.mark.parametrize("case", CASES)
+    def test_no_crash(self, case):
+        code = textwrap.dedent(self.PRELUDE) + textwrap.dedent(self.CASES[case])
+        rc, err = run_isolated(code)
+        assert rc == 0, err[-2000:]

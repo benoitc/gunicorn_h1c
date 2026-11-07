@@ -75,6 +75,7 @@ typedef struct {
     int permit_unconventional_http_method;
     int permit_unconventional_http_version;
     int remaining_truncated;
+    int in_feed;  /* 1 while feed() or finish() run, callbacks included */
 
     /* Parser state */
     int state;
@@ -334,6 +335,7 @@ H1CProtocol_init_impl(H1CProtocol *self, PyObject *args, PyObject *kwargs)
     self->limit_request_field_size = limit_request_field_size;
     self->limit_remaining = limit_remaining;
     self->remaining_truncated = 0;
+    self->in_feed = 0;
     self->permit_unconventional_http_method = permit_unconventional_http_method;
     self->permit_unconventional_http_version = permit_unconventional_http_version;
 
@@ -389,7 +391,7 @@ H1CProtocol_init(H1CProtocol *self, PyObject *args, PyObject *kwargs)
  * Feed data to the parser. Callbacks fire synchronously.
  */
 static PyObject *
-H1CProtocol_feed_impl(H1CProtocol *self, PyObject *args)
+H1CProtocol_feed_run(H1CProtocol *self, PyObject *args)
 {
     Py_buffer buf;
 
@@ -707,77 +709,80 @@ H1CProtocol_feed_headers(H1CProtocol *self)
         return -1;
     }
 
-    /* Headers complete - store data */
-    self->minor_version = minor_version;
-
-    /* Create method bytes */
-    Py_XDECREF(self->py_method);
-    self->py_method = PyBytes_FromStringAndSize(method, method_len);
-    if (!self->py_method) return -1;
-
-    /* Create path bytes */
-    Py_XDECREF(self->py_path);
-    self->py_path = PyBytes_FromStringAndSize(path, path_len);
-    if (!self->py_path) return -1;
-
-    /* Fire on_url callback */
-    if (self->on_url) {
-        PyObject *result = PyObject_CallOneArg(self->on_url, self->py_path);
-        if (!result) return -1;
-        Py_DECREF(result);
-    }
-
-    /* Process headers */
-    Py_XDECREF(self->py_headers);
-    self->py_headers = PyList_New(num_headers);
-    if (!self->py_headers) return -1;
-
-    /* Clear cached ASGI headers */
-    Py_XDECREF(self->py_asgi_headers);
-    self->py_asgi_headers = NULL;
-
-    /* Extract special headers using shared utility */
+    /* Validate framing before anything is published or any callback runs,
+     * so a rejected request leaves no half-built state behind. */
     PicoHeaderInfo hdr_info;
     pico_extract_headers(headers, num_headers, &hdr_info);
-
-    /* Validate header framing for request smuggling prevention */
     if (pico_validate_header_framing(&hdr_info, minor_version, InvalidHeader) < 0) {
         return -1;
     }
 
+    /* Build every object first, then publish them together */
+    PyObject *py_method = PyBytes_FromStringAndSize(method, method_len);
+    PyObject *py_path = PyBytes_FromStringAndSize(path, path_len);
+    PyObject *py_headers = PyList_New(num_headers);
+    if (!py_method || !py_path || !py_headers) {
+        Py_XDECREF(py_method);
+        Py_XDECREF(py_path);
+        Py_XDECREF(py_headers);
+        return -1;
+    }
+    for (size_t i = 0; i < num_headers; i++) {
+        PyObject *tuple = pico_create_header_tuple(
+            headers[i].name, headers[i].name_len,
+            headers[i].value, headers[i].value_len);
+        if (!tuple) {
+            Py_DECREF(py_method);
+            Py_DECREF(py_path);
+            Py_DECREF(py_headers);
+            return -1;
+        }
+        PyList_SET_ITEM(py_headers, i, tuple);
+    }
+
+    self->minor_version = minor_version;
+    PyObject *old_method = self->py_method;
+    PyObject *old_path = self->py_path;
+    PyObject *old_headers = self->py_headers;
+    self->py_method = py_method;
+    self->py_path = py_path;
+    self->py_headers = py_headers;
+    Py_XDECREF(old_method);
+    Py_XDECREF(old_path);
+    Py_XDECREF(old_headers);
+    Py_CLEAR(self->py_asgi_headers);
     self->content_length = hdr_info.content_length;
     self->is_chunked = hdr_info.has_chunked;
     self->connection_close = hdr_info.connection_close;
     self->should_upgrade = hdr_info.should_upgrade;
 
-    for (size_t i = 0; i < num_headers; i++) {
-        const char *name = headers[i].name;
-        size_t name_len = headers[i].name_len;
-        const char *value = headers[i].value;
-        size_t value_len = headers[i].value_len;
+    /* Callbacks run on complete, validated state. They get their own
+     * references, since a callback may replace the published objects. */
+    if (self->on_url) {
+        PyObject *arg = py_path;
+        Py_INCREF(arg);
+        PyObject *result = PyObject_CallOneArg(self->on_url, arg);
+        Py_DECREF(arg);
+        if (!result) return -1;
+        Py_DECREF(result);
+    }
 
-        /* Create header tuple using shared utility */
-        PyObject *tuple = pico_create_header_tuple(name, name_len, value, value_len);
-        if (!tuple) return -1;
-
-        PyList_SET_ITEM(self->py_headers, i, tuple);
-
-        /* Fire on_header callback */
-        if (self->on_header) {
-            PyObject *name_obj = PyBytes_FromStringAndSize(name, name_len);
-            PyObject *value_obj = PyBytes_FromStringAndSize(value, value_len);
-            if (!name_obj || !value_obj) {
-                Py_XDECREF(name_obj);
-                Py_XDECREF(value_obj);
+    if (self->on_header && num_headers > 0) {
+        Py_INCREF(py_headers);
+        for (size_t i = 0; i < num_headers; i++) {
+            PyObject *tuple = PyList_GET_ITEM(py_headers, i);
+            Py_INCREF(tuple);
+            PyObject *result = PyObject_CallFunctionObjArgs(
+                self->on_header, PyTuple_GET_ITEM(tuple, 0),
+                PyTuple_GET_ITEM(tuple, 1), NULL);
+            Py_DECREF(tuple);
+            if (!result) {
+                Py_DECREF(py_headers);
                 return -1;
             }
-            PyObject *result = PyObject_CallFunctionObjArgs(
-                self->on_header, name_obj, value_obj, NULL);
-            Py_DECREF(name_obj);
-            Py_DECREF(value_obj);
-            if (!result) return -1;
             Py_DECREF(result);
         }
+        Py_DECREF(py_headers);
     }
 
     /* Fire on_headers_complete callback */
@@ -1220,7 +1225,7 @@ H1CProtocol_get_remaining_truncated_impl(H1CProtocol *self, void *closure)
  * chunked encoding without final trailer CRLF.
  */
 static PyObject *
-H1CProtocol_finish_impl(H1CProtocol *self, PyObject *Py_UNUSED(ignored))
+H1CProtocol_finish_run(H1CProtocol *self)
 {
     if (self->state == STATE_BODY_CHUNKED_TRAILER) {
         /* All body data received, just missing final CRLF */
@@ -1237,11 +1242,55 @@ H1CProtocol_finish_impl(H1CProtocol *self, PyObject *Py_UNUSED(ignored))
 }
 
 /*
+ * Callbacks run while feed() and finish() hold pointers into the buffer and
+ * the header array, so calling back into the parser from one of them would
+ * pull that state from under the running call. Refuse it.
+ */
+static int
+H1CProtocol_check_not_in_feed(H1CProtocol *self, const char *what)
+{
+    if (self->in_feed) {
+        PyErr_Format(PyExc_RuntimeError,
+            "H1CProtocol.%s() cannot be called from a parser callback", what);
+        return -1;
+    }
+    return 0;
+}
+
+static PyObject *
+H1CProtocol_feed_impl(H1CProtocol *self, PyObject *args)
+{
+    if (H1CProtocol_check_not_in_feed(self, "feed") < 0) {
+        return NULL;
+    }
+    self->in_feed = 1;
+    PyObject *result = H1CProtocol_feed_run(self, args);
+    self->in_feed = 0;
+    return result;
+}
+
+static PyObject *
+H1CProtocol_finish_impl(H1CProtocol *self, PyObject *Py_UNUSED(ignored))
+{
+    if (H1CProtocol_check_not_in_feed(self, "finish") < 0) {
+        return NULL;
+    }
+    self->in_feed = 1;
+    PyObject *result = H1CProtocol_finish_run(self);
+    self->in_feed = 0;
+    return result;
+}
+
+/*
  * Reset the parser for the next request (keepalive).
  */
 static PyObject *
 H1CProtocol_reset_impl(H1CProtocol *self, PyObject *Py_UNUSED(ignored))
 {
+    if (H1CProtocol_check_not_in_feed(self, "reset") < 0) {
+        return NULL;
+    }
+
     self->state = STATE_IDLE;
     /* Drops any tail: capture remaining() first, then feed it back after
      * reset() so it is parsed as the next message. */
@@ -1332,6 +1381,28 @@ H1CProtocol_get_headers_impl(H1CProtocol *self, void *closure)
     return PyList_New(0);
 }
 
+/*
+ * The list returned by `headers` is the parser's own (on GIL builds), so a
+ * caller may have changed it. Check an item before reading it as a
+ * (bytes, bytes) pair instead of trusting it.
+ */
+static int
+H1CProtocol_header_item(PyObject *list, Py_ssize_t i,
+                        PyObject **name, PyObject **value)
+{
+    PyObject *item = PyList_GET_ITEM(list, i);
+    if (!PyTuple_Check(item) || PyTuple_GET_SIZE(item) != 2 ||
+        !PyBytes_Check(PyTuple_GET_ITEM(item, 0)) ||
+        !PyBytes_Check(PyTuple_GET_ITEM(item, 1))) {
+        PyErr_SetString(PyExc_TypeError,
+            "H1CProtocol.headers items must be (bytes, bytes) tuples");
+        return -1;
+    }
+    *name = PyTuple_GET_ITEM(item, 0);
+    *value = PyTuple_GET_ITEM(item, 1);
+    return 0;
+}
+
 static PyObject *
 H1CProtocol_get_asgi_headers_impl(H1CProtocol *self, void *closure)
 {
@@ -1340,14 +1411,27 @@ H1CProtocol_get_asgi_headers_impl(H1CProtocol *self, void *closure)
     }
 
     if (!self->py_asgi_headers) {
-        Py_ssize_t n = PyList_GET_SIZE(self->py_headers);
-        self->py_asgi_headers = PyList_New(n);
-        if (!self->py_asgi_headers) return NULL;
+        PyObject *src = self->py_headers;
+        Py_INCREF(src);
+        Py_ssize_t n = PyList_GET_SIZE(src);
+        PyObject *out = PyList_New(n);
+        if (!out) {
+            Py_DECREF(src);
+            return NULL;
+        }
 
         for (Py_ssize_t i = 0; i < n; i++) {
-            PyObject *tuple = PyList_GET_ITEM(self->py_headers, i);
-            PyObject *name = PyTuple_GET_ITEM(tuple, 0);
-            PyObject *value = PyTuple_GET_ITEM(tuple, 1);
+            PyObject *name, *value;
+            if (i >= PyList_GET_SIZE(src) ||
+                H1CProtocol_header_item(src, i, &name, &value) < 0) {
+                if (!PyErr_Occurred()) {
+                    PyErr_SetString(PyExc_RuntimeError,
+                        "H1CProtocol.headers changed size");
+                }
+                Py_DECREF(out);
+                Py_DECREF(src);
+                return NULL;
+            }
 
             const char *name_str = PyBytes_AS_STRING(name);
             Py_ssize_t name_len = PyBytes_GET_SIZE(name);
@@ -1356,11 +1440,15 @@ H1CProtocol_get_asgi_headers_impl(H1CProtocol *self, void *closure)
                 name_str, name_len,
                 PyBytes_AS_STRING(value), PyBytes_GET_SIZE(value));
             if (!pair) {
-                Py_CLEAR(self->py_asgi_headers);
+                Py_DECREF(out);
+                Py_DECREF(src);
                 return NULL;
             }
-            PyList_SET_ITEM(self->py_asgi_headers, i, pair);
+            PyList_SET_ITEM(out, i, pair);
         }
+        Py_DECREF(src);
+        Py_XDECREF(self->py_asgi_headers);
+        self->py_asgi_headers = out;
     }
     Py_INCREF(self->py_asgi_headers);
     return self->py_asgi_headers;
@@ -1424,11 +1512,13 @@ H1CProtocol_get_header_impl(H1CProtocol *self, PyObject *args)
         Py_RETURN_NONE;
     }
 
-    Py_ssize_t n = PyList_GET_SIZE(self->py_headers);
-    for (Py_ssize_t i = 0; i < n; i++) {
-        PyObject *tuple = PyList_GET_ITEM(self->py_headers, i);
-        PyObject *hname = PyTuple_GET_ITEM(tuple, 0);
-        PyObject *hvalue = PyTuple_GET_ITEM(tuple, 1);
+    PyObject *list = self->py_headers;
+    for (Py_ssize_t i = 0; i < PyList_GET_SIZE(list); i++) {
+        PyObject *hname, *hvalue;
+        if (H1CProtocol_header_item(list, i, &hname, &hvalue) < 0) {
+            PyBuffer_Release(&name_buf);
+            return NULL;
+        }
 
         /* Case-insensitive compare */
         const char *hname_str = PyBytes_AS_STRING(hname);
