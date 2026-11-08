@@ -108,9 +108,7 @@ typedef struct {
     size_t chunk_remaining;
     int skip_body;
 
-    /* Line scanning in the chunked body: where the CRLF search resumes, so
-     * bytes already scanned are not scanned again on the next feed(). */
-    size_t scan_from;
+    /* Trailer lines seen in the chunked body */
     Py_ssize_t trailer_count;
 
 } H1CProtocol;
@@ -119,7 +117,8 @@ typedef struct {
 static int H1CProtocol_feed_headers(H1CProtocol *self);
 static int H1CProtocol_feed_body_content_length(H1CProtocol *self, const char *data,
                                                 size_t len, int data_is_buffer);
-static int H1CProtocol_feed_body_chunked(H1CProtocol *self);
+static int H1CProtocol_feed_body_chunked(H1CProtocol *self, const char *data,
+                                         size_t len, int data_is_buffer);
 static int H1CProtocol_keep_tail(H1CProtocol *self, const char *data, size_t len,
                                  size_t consumed, int data_is_buffer);
 static void H1CProtocol_clamp_tail(H1CProtocol *self);
@@ -369,7 +368,6 @@ H1CProtocol_init_impl(H1CProtocol *self, PyObject *args, PyObject *kwargs)
     self->chunk_size = 0;
     self->chunk_remaining = 0;
     self->skip_body = 0;
-    self->scan_from = 0;
     self->trailer_count = 0;
 
     return 0;
@@ -442,16 +440,10 @@ H1CProtocol_feed_run(H1CProtocol *self, PyObject *args)
     }
     else if (self->state >= STATE_BODY_CHUNKED_SIZE &&
              self->state <= STATE_BODY_CHUNKED_TRAILER) {
-        /* Buffer data for chunked parsing */
-        if (ensure_buffer_capacity(self, buf.len) < 0) {
-            PyBuffer_Release(&buf);
-            return NULL;
-        }
-        memcpy(self->buffer + self->buffer_len, buf.buf, buf.len);
-        self->buffer_len += buf.len;
+        /* Decoded straight from the caller's bytes */
+        int ret = H1CProtocol_feed_body_chunked(self, buf.buf, (size_t)buf.len, 0);
         PyBuffer_Release(&buf);
-
-        if (H1CProtocol_feed_body_chunked(self) < 0) {
+        if (ret < 0) {
             return NULL;
         }
     }
@@ -882,10 +874,12 @@ H1CProtocol_feed_headers(H1CProtocol *self)
         self->state = STATE_BODY_CHUNKED_SIZE;
         self->chunk_size = 0;
         self->chunk_remaining = 0;
-        self->scan_from = 0;
         self->trailer_count = 0;
+        /* The body bytes that came with the head are at the start of the
+         * buffer; nothing is pending yet. */
+        self->buffer_len = 0;
         if (remaining > 0) {
-            return H1CProtocol_feed_body_chunked(self);
+            return H1CProtocol_feed_body_chunked(self, self->buffer, remaining, 1);
         }
     }
     else if (self->content_length > 0) {
@@ -989,272 +983,356 @@ H1CProtocol_line_limit(H1CProtocol *self)
     return PICO_FALLBACK_MAX_FIELD_LINE;
 }
 
-/*
- * Find the end of the line at the start of the buffer.
- *
- * Only bytes not scanned on a previous call are scanned, and a buffer that
- * can no longer hold a line of at most `limit` bytes plus a pending CR is an
- * error instead of growing until a terminator arrives. Same rule as
- * _find_line() in gunicorn/asgi/parser.py.
- *
- * Returns the offset of the CR, -1 when more data is needed, -2 on a bare
- * LF and -3 when the line is too long.
- */
-static Py_ssize_t
-H1CProtocol_find_line(H1CProtocol *self, size_t limit)
+/* Messages shared by the two places a chunked line can end */
+#define PICO_CHUNK_BARE_LF \
+    "Bare LF in chunk size line, CRLF required (RFC 9112 section 7.1)"
+#define PICO_TRAILER_BARE_LF \
+    "Bare LF in trailer section, CRLF required (RFC 9112 section 7.1.2)"
+
+/* A chunk-size or trailer line got longer than its limit before its CRLF */
+static int
+H1CProtocol_chunk_line_too_long(H1CProtocol *self)
 {
-    Py_ssize_t idx = find_crlf(self->buffer, self->buffer_len, self->scan_from);
-    if (idx == -1) {
-        if (self->buffer_len > limit + 1) {
-            return -3;
-        }
-        self->scan_from = self->buffer_len;
-        return -1;
+    if (self->state == STATE_BODY_CHUNKED_SIZE) {
+        PyErr_Format(ParseError, "chunk size line over %zu bytes",
+                     H1CProtocol_line_limit(self));
+    } else {
+        PyErr_Format(LimitRequestHeaders, "Request trailer field over %zu bytes",
+                     H1CProtocol_line_limit(self));
     }
-    self->scan_from = 0;
-    return idx;
+    return -1;
+}
+
+static int
+H1CProtocol_chunk_bare_lf(H1CProtocol *self)
+{
+    PyErr_SetString(ParseError, self->state == STATE_BODY_CHUNKED_SIZE
+                    ? PICO_CHUNK_BARE_LF : PICO_TRAILER_BARE_LF);
+    return -1;
 }
 
 /*
- * Parse chunked transfer encoding body.
+ * One complete chunk-size line, without its CRLF (RFC 9112 section 7.1).
+ * A server ought to limit the length of chunk extensions (section 7.1.1);
+ * the whole line is bounded by the field size limit.
  */
 static int
-H1CProtocol_feed_body_chunked(H1CProtocol *self)
+H1CProtocol_chunk_size_line(H1CProtocol *self, const char *line, size_t line_len)
 {
-    while (1) {
-        if (self->state == STATE_BODY_CHUNKED_SIZE) {
-            /* Look for chunk size line (RFC 9112 section 7.1). A server
-             * ought to limit the length of chunk extensions (section
-             * 7.1.1); the whole line is bounded by the field size limit. */
-            Py_ssize_t idx = H1CProtocol_find_line(
-                self, H1CProtocol_line_limit(self));
-            if (idx == -1) {
-                return 0;  /* Need more data */
-            }
-            if (idx == -3) {
-                PyErr_Format(ParseError,
-                    "chunk size line over %zu bytes",
-                    H1CProtocol_line_limit(self));
-                return -1;
-            }
-            if (idx == -2) {
-                PyErr_SetString(ParseError,
-                    "Bare LF in chunk size line, CRLF required "
-                    "(RFC 9112 section 7.1)");
-                return -1;
-            }
+    /* The same bound applies once the CRLF is there, so whether a line is
+     * accepted does not depend on how the bytes arrived. */
+    if (line_len > H1CProtocol_line_limit(self)) {
+        return H1CProtocol_chunk_line_too_long(self);
+    }
 
-            size_t line_len = (size_t)idx;
+    /* Parse chunk size (may have extensions after ;) */
+    const char *semicolon = memchr(line, ';', line_len);
+    size_t size_len = semicolon ? (size_t)(semicolon - line) : line_len;
 
-            /* The same bound applies once the CRLF is there, so whether a
-             * line is accepted does not depend on how the bytes arrived. */
-            if (line_len > H1CProtocol_line_limit(self)) {
-                PyErr_Format(ParseError,
-                    "chunk size line over %zu bytes",
-                    H1CProtocol_line_limit(self));
-                return -1;
-            }
-
-            /* Parse chunk size (may have extensions after ;) */
-            char *semicolon = memchr(self->buffer, ';', line_len);
-            size_t size_len = semicolon ? (size_t)(semicolon - self->buffer) : line_len;
-
-            /* RFC 9112: chunk-ext must not contain bare CR */
-            if (semicolon) {
-                size_t ext_len = line_len - size_len - 1;
-                if (memchr(semicolon + 1, '\r', ext_len)) {
-                    PyErr_SetString(InvalidChunkExtension,
-                        "Invalid chunk extension: bare CR not allowed");
-                    return -1;
-                }
-            }
-
-            /* Reject empty chunk size */
-            if (size_len == 0) {
-                PyErr_SetString(ParseError, "Empty chunk size");
-                return -1;
-            }
-
-            /* Reject leading/trailing whitespace (request smuggling vector) */
-            if (self->buffer[0] == ' ' || self->buffer[0] == '\t') {
-                PyErr_SetString(ParseError, "Whitespace in chunk size");
-                return -1;
-            }
-            if (size_len > 0 && (self->buffer[size_len-1] == ' ' || self->buffer[size_len-1] == '\t')) {
-                PyErr_SetString(ParseError, "Whitespace in chunk size");
-                return -1;
-            }
-
-            /* Parse hex number - strict validation, no whitespace allowed */
-            size_t chunk_size = 0;
-            for (size_t i = 0; i < size_len; i++) {
-                char c = self->buffer[i];
-                size_t digit;
-                if (c >= '0' && c <= '9') {
-                    digit = c - '0';
-                } else if (c >= 'a' && c <= 'f') {
-                    digit = c - 'a' + 10;
-                } else if (c >= 'A' && c <= 'F') {
-                    digit = c - 'A' + 10;
-                } else {
-                    /* Reject any non-hex character including whitespace */
-                    PyErr_SetString(ParseError, "Invalid character in chunk size");
-                    return -1;
-                }
-                /* RFC 9112 section 7.1: guard against integer overflow
-                 * instead of wrapping to a smaller chunk. */
-                if (chunk_size > (SIZE_MAX >> 4)) {
-                    PyErr_SetString(ParseError, "chunk size too large");
-                    return -1;
-                }
-                chunk_size = chunk_size * 16 + digit;
-            }
-
-            self->chunk_size = chunk_size;
-            self->chunk_remaining = chunk_size;
-
-            /* Remove size line from buffer */
-            size_t consumed = line_len + 2;
-            memmove(self->buffer, self->buffer + consumed, self->buffer_len - consumed);
-            self->buffer_len -= consumed;
-
-            if (chunk_size == 0) {
-                /* Last chunk - parse trailers */
-                self->state = STATE_BODY_CHUNKED_TRAILER;
-            } else {
-                self->state = STATE_BODY_CHUNKED_DATA;
-            }
+    /* RFC 9112: chunk-ext must not contain bare CR */
+    if (semicolon) {
+        size_t ext_len = line_len - size_len - 1;
+        if (memchr(semicolon + 1, '\r', ext_len)) {
+            PyErr_SetString(InvalidChunkExtension,
+                "Invalid chunk extension: bare CR not allowed");
+            return -1;
         }
-        else if (self->state == STATE_BODY_CHUNKED_DATA) {
-            if (self->buffer_len == 0) {
-                return 0;  /* Need more data */
+    }
+
+    /* Reject empty chunk size */
+    if (size_len == 0) {
+        PyErr_SetString(ParseError, "Empty chunk size");
+        return -1;
+    }
+
+    /* Reject leading/trailing whitespace (request smuggling vector) */
+    if (line[0] == ' ' || line[0] == '\t' ||
+        line[size_len - 1] == ' ' || line[size_len - 1] == '\t') {
+        PyErr_SetString(ParseError, "Whitespace in chunk size");
+        return -1;
+    }
+
+    /* Parse hex number - strict validation, no whitespace allowed */
+    size_t chunk_size = 0;
+    for (size_t i = 0; i < size_len; i++) {
+        char c = line[i];
+        size_t digit;
+        if (c >= '0' && c <= '9') {
+            digit = c - '0';
+        } else if (c >= 'a' && c <= 'f') {
+            digit = c - 'a' + 10;
+        } else if (c >= 'A' && c <= 'F') {
+            digit = c - 'A' + 10;
+        } else {
+            /* Reject any non-hex character including whitespace */
+            PyErr_SetString(ParseError, "Invalid character in chunk size");
+            return -1;
+        }
+        /* RFC 9112 section 7.1: guard against integer overflow instead of
+         * wrapping to a smaller chunk. */
+        if (chunk_size > (SIZE_MAX >> 4)) {
+            PyErr_SetString(ParseError, "chunk size too large");
+            return -1;
+        }
+        chunk_size = chunk_size * 16 + digit;
+    }
+
+    self->chunk_size = chunk_size;
+    self->chunk_remaining = chunk_size;
+    self->state = chunk_size == 0 ? STATE_BODY_CHUNKED_TRAILER
+                                  : STATE_BODY_CHUNKED_DATA;
+    return 0;
+}
+
+/*
+ * One complete trailer line, without its CRLF. RFC 9112 section 7.1.2:
+ * trailer-section = *( field-line CRLF ). Each line is bounded like a header
+ * line, and their number like the header count. Returns 1 on the empty line
+ * that ends the message, 0 to go on, -1 on error.
+ */
+static int
+H1CProtocol_trailer_line(H1CProtocol *self, const char *line, size_t line_len)
+{
+    /* Like a header line: field line plus CRLF within the limit */
+    if (line_len + 2 > H1CProtocol_line_limit(self)) {
+        return H1CProtocol_chunk_line_too_long(self);
+    }
+    if (memchr(line, '\r', line_len)) {
+        PyErr_SetString(ParseError,
+            "Bare CR in trailer section (RFC 9112 section 2.2)");
+        return -1;
+    }
+    if (line_len == 0) {
+        return 1;
+    }
+
+    Py_ssize_t max_fields = self->limit_request_fields > 0
+        ? self->limit_request_fields : PICO_FALLBACK_MAX_FIELDS;
+    if (++self->trailer_count > max_fields) {
+        PyErr_Format(LimitRequestHeaders,
+            "Too many trailer fields (limit %zd)", max_fields);
+        return -1;
+    }
+
+    /* RFC 9110 section 6.5.1: forbid routing/framing/auth fields in a
+     * trailer. Find the colon that ends the field-name. */
+    const char *colon = memchr(line, ':', line_len);
+    if (colon) {
+        size_t name_len = (size_t)(colon - line);
+        while (name_len > 0 &&
+               (line[name_len - 1] == ' ' || line[name_len - 1] == '\t')) {
+            name_len--;
+        }
+        if (pico_is_forbidden_trailer_name(line, name_len)) {
+            PyErr_Format(InvalidHeaderName,
+                "Header field not allowed in trailer: %.*s",
+                (int)name_len, line);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Hand decoded chunk data to on_body */
+static int
+H1CProtocol_chunk_data(H1CProtocol *self, const char *data, size_t len)
+{
+    if (self->skip_body || !self->on_body || len == 0) {
+        return 0;
+    }
+    PyObject *chunk = PyBytes_FromStringAndSize(data, (Py_ssize_t)len);
+    if (!chunk) return -1;
+    PyObject *result = PyObject_CallOneArg(self->on_body, chunk);
+    Py_DECREF(chunk);
+    if (!result) return -1;
+    Py_DECREF(result);
+    return 0;
+}
+
+#define PICO_CHUNKED_NEED_MORE 0
+#define PICO_CHUNKED_DONE 1
+
+/*
+ * Decode chunked data in place from data[*pos], with no copy and no shifting:
+ * chunk data goes to on_body straight from these bytes. Returns
+ * PICO_CHUNKED_NEED_MORE with *pos at the start of the bytes that cannot be
+ * used yet (an incomplete line or CRLF), PICO_CHUNKED_DONE with *pos just
+ * past the message, or -1 on error.
+ */
+static int
+H1CProtocol_decode_chunked(H1CProtocol *self, const char *data, size_t len,
+                           size_t *pos_io)
+{
+    size_t pos = *pos_io;
+    size_t limit = H1CProtocol_line_limit(self);
+
+    while (1) {
+        if (self->state == STATE_BODY_CHUNKED_DATA) {
+            size_t avail = len - pos;
+            if (avail == 0) break;
+            size_t take = avail < self->chunk_remaining
+                ? avail : self->chunk_remaining;
+            if (H1CProtocol_chunk_data(self, data + pos, take) < 0) {
+                return -1;
             }
-
-            size_t available = self->buffer_len;
-            if (available > self->chunk_remaining) {
-                available = self->chunk_remaining;
-            }
-
-            /* Fire on_body callback */
-            if (!self->skip_body && self->on_body && available > 0) {
-                PyObject *chunk = PyBytes_FromStringAndSize(self->buffer, available);
-                if (!chunk) return -1;
-                PyObject *result = PyObject_CallOneArg(self->on_body, chunk);
-                Py_DECREF(chunk);
-                if (!result) return -1;
-                Py_DECREF(result);
-            }
-
-            /* Remove consumed data from buffer */
-            memmove(self->buffer, self->buffer + available, self->buffer_len - available);
-            self->buffer_len -= available;
-            self->chunk_remaining -= available;
-
+            pos += take;
+            self->chunk_remaining -= take;
             if (self->chunk_remaining == 0) {
                 self->state = STATE_BODY_CHUNKED_CRLF;
             }
         }
         else if (self->state == STATE_BODY_CHUNKED_CRLF) {
-            /* Expect CRLF after chunk data */
-            if (self->buffer_len < 2) {
-                return 0;  /* Need more data */
-            }
-
-            if (self->buffer[0] != '\r' || self->buffer[1] != '\n') {
+            /* RFC 9112 section 7.1: chunk-data is followed by CRLF */
+            if (len - pos < 2) break;
+            if (data[pos] != '\r' || data[pos + 1] != '\n') {
                 PyErr_SetString(ParseError, "Missing CRLF after chunk");
                 return -1;
             }
-
-            memmove(self->buffer, self->buffer + 2, self->buffer_len - 2);
-            self->buffer_len -= 2;
+            pos += 2;
             self->state = STATE_BODY_CHUNKED_SIZE;
         }
-        else if (self->state == STATE_BODY_CHUNKED_TRAILER) {
-            /* Parse trailers (we just skip them). RFC 9112 section 7.1.2:
-             * trailer-section = *( field-line CRLF ). Each line is bounded
-             * like a header line, and their number like the header count. */
-            Py_ssize_t idx = H1CProtocol_find_line(
-                self, H1CProtocol_line_limit(self));
-            if (idx == -1) {
-                return 0;  /* Need more data */
-            }
-            if (idx == -3) {
-                PyErr_Format(LimitRequestHeaders,
-                    "Request trailer field over %zu bytes",
-                    H1CProtocol_line_limit(self));
-                return -1;
-            }
-            if (idx == -2) {
-                PyErr_SetString(ParseError,
-                    "Bare LF in trailer section, CRLF required "
-                    "(RFC 9112 section 7.1.2)");
-                return -1;
-            }
-
-            size_t line_len = (size_t)idx;
-            /* Like a header line: field line plus CRLF within the limit */
-            if (line_len + 2 > H1CProtocol_line_limit(self)) {
-                PyErr_Format(LimitRequestHeaders,
-                    "Request trailer field over %zu bytes",
-                    H1CProtocol_line_limit(self));
-                return -1;
-            }
-            if (memchr(self->buffer, '\r', line_len)) {
-                PyErr_SetString(ParseError,
-                    "Bare CR in trailer section (RFC 9112 section 2.2)");
-                return -1;
-            }
-            if (line_len == 0) {
-                /* Empty line - end of trailers */
-                memmove(self->buffer, self->buffer + 2, self->buffer_len - 2);
-                self->buffer_len -= 2;
-                self->state = STATE_COMPLETE;
-                H1CProtocol_clamp_tail(self);
-                if (self->on_message_complete) {
-                    PyObject *result = PyObject_CallNoArgs(self->on_message_complete);
-                    if (!result) return -1;
-                    Py_DECREF(result);
+        else if (self->state == STATE_BODY_CHUNKED_SIZE ||
+                 self->state == STATE_BODY_CHUNKED_TRAILER) {
+            const char *line = data + pos;
+            size_t avail = len - pos;
+            const char *lf = memchr(line, '\n', avail);
+            if (!lf) {
+                /* Same rule as _find_line() in gunicorn/asgi/parser.py: a
+                 * line still waiting for its CRLF may hold its limit plus a
+                 * pending CR. */
+                if (avail > limit + 1) {
+                    return H1CProtocol_chunk_line_too_long(self);
                 }
-                return 0;
+                break;
             }
-
-            Py_ssize_t max_fields = self->limit_request_fields > 0
-                ? self->limit_request_fields : PICO_FALLBACK_MAX_FIELDS;
-            if (++self->trailer_count > max_fields) {
-                PyErr_Format(LimitRequestHeaders,
-                    "Too many trailer fields (limit %zd)", max_fields);
-                return -1;
+            if (lf == line || lf[-1] != '\r') {
+                return H1CProtocol_chunk_bare_lf(self);
             }
-
-            /* RFC 9110 section 6.5.1: forbid routing/framing/auth fields
-             * in a trailer. Find the colon that ends the field-name. */
-            char *colon = memchr(self->buffer, ':', line_len);
-            if (colon) {
-                char *name_start = self->buffer;
-                size_t name_len = (size_t)(colon - name_start);
-                while (name_len > 0 &&
-                       (name_start[name_len - 1] == ' ' ||
-                        name_start[name_len - 1] == '\t')) {
-                    name_len--;
-                }
-                if (pico_is_forbidden_trailer_name(name_start, name_len)) {
-                    PyErr_Format(InvalidHeaderName,
-                        "Header field not allowed in trailer: %.*s",
-                        (int)name_len, name_start);
+            size_t line_len = (size_t)(lf - 1 - line);
+            pos = (size_t)(lf + 1 - data);
+            if (self->state == STATE_BODY_CHUNKED_SIZE) {
+                if (H1CProtocol_chunk_size_line(self, line, line_len) < 0) {
                     return -1;
                 }
+            } else {
+                int rc = H1CProtocol_trailer_line(self, line, line_len);
+                if (rc < 0) return -1;
+                if (rc == 1) {
+                    *pos_io = pos;
+                    return PICO_CHUNKED_DONE;
+                }
             }
-
-            /* Skip trailer line */
-            size_t consumed = line_len + 2;
-            memmove(self->buffer, self->buffer + consumed, self->buffer_len - consumed);
-            self->buffer_len -= consumed;
         }
         else {
             break;
         }
     }
 
+    *pos_io = pos;
+    return PICO_CHUNKED_NEED_MORE;
+}
+
+/*
+ * Feed chunked body bytes. Only what cannot be used yet, an incomplete
+ * chunk-size or trailer line or the CRLF after chunk data, is kept in
+ * self->buffer; it is completed from the next feed() before decoding goes
+ * on in place.
+ *
+ * data may point into self->buffer (body bytes that came with the head)
+ * only when nothing is pending, which data_is_buffer says.
+ */
+static int
+H1CProtocol_feed_body_chunked(H1CProtocol *self, const char *data, size_t len,
+                              int data_is_buffer)
+{
+    size_t pos = 0;
+    int rc = PICO_CHUNKED_NEED_MORE;
+
+    if (self->buffer_len > 0) {
+        /* Complete the pending piece with as few bytes as it needs */
+        if (self->state == STATE_BODY_CHUNKED_CRLF) {
+            size_t need = 2 - self->buffer_len;
+            if (len < need) need = len;
+            if (ensure_buffer_capacity(self, need) < 0) return -1;
+            memcpy(self->buffer + self->buffer_len, data, need);
+            self->buffer_len += need;
+            pos = need;
+            if (self->buffer_len < 2) return 0;
+            self->buffer_len = 0;
+            if (self->buffer[0] != '\r' || self->buffer[1] != '\n') {
+                PyErr_SetString(ParseError, "Missing CRLF after chunk");
+                return -1;
+            }
+            self->state = STATE_BODY_CHUNKED_SIZE;
+        } else {
+            size_t limit = H1CProtocol_line_limit(self);
+            const char *lf = memchr(data, '\n', len);
+            if (!lf) {
+                if (self->buffer_len + len > limit + 1) {
+                    return H1CProtocol_chunk_line_too_long(self);
+                }
+                if (ensure_buffer_capacity(self, len) < 0) return -1;
+                memcpy(self->buffer + self->buffer_len, data, len);
+                self->buffer_len += len;
+                return 0;
+            }
+            char before = lf > data ? lf[-1] : self->buffer[self->buffer_len - 1];
+            if (before != '\r') {
+                return H1CProtocol_chunk_bare_lf(self);
+            }
+            size_t take = (size_t)(lf - data) + 1;
+            size_t full = self->buffer_len + take - 2;
+            if (full > limit || (self->state == STATE_BODY_CHUNKED_TRAILER &&
+                                 full + 2 > limit)) {
+                return H1CProtocol_chunk_line_too_long(self);
+            }
+            if (ensure_buffer_capacity(self, take) < 0) return -1;
+            memcpy(self->buffer + self->buffer_len, data, take);
+            size_t line_len = self->buffer_len + take - 2;
+            self->buffer_len = 0;
+            pos = take;
+            if (self->state == STATE_BODY_CHUNKED_SIZE) {
+                if (H1CProtocol_chunk_size_line(self, self->buffer, line_len) < 0) {
+                    return -1;
+                }
+            } else {
+                int t = H1CProtocol_trailer_line(self, self->buffer, line_len);
+                if (t < 0) return -1;
+                if (t == 1) rc = PICO_CHUNKED_DONE;
+            }
+        }
+    }
+
+    if (rc != PICO_CHUNKED_DONE) {
+        rc = H1CProtocol_decode_chunked(self, data, len, &pos);
+        if (rc < 0) return -1;
+    }
+
+    if (rc == PICO_CHUNKED_NEED_MORE) {
+        /* Keep the incomplete piece for the next feed() */
+        size_t rest = len - pos;
+        if (rest > 0) {
+            if (data_is_buffer) {
+                memmove(self->buffer, data + pos, rest);
+            } else {
+                if (ensure_buffer_capacity(self, rest) < 0) return -1;
+                memcpy(self->buffer, data + pos, rest);
+            }
+        }
+        self->buffer_len = rest;
+        return 0;
+    }
+
+    /* End of the message: what follows belongs to the next one */
+    self->state = STATE_COMPLETE;
+    if (H1CProtocol_keep_tail(self, data, len, pos, data_is_buffer) < 0) {
+        return -1;
+    }
+    if (self->on_message_complete) {
+        PyObject *result = PyObject_CallNoArgs(self->on_message_complete);
+        if (!result) return -1;
+        Py_DECREF(result);
+    }
     return 0;
 }
 
@@ -1363,7 +1441,6 @@ H1CProtocol_reset_impl(H1CProtocol *self, PyObject *Py_UNUSED(ignored))
     self->hdr_line_start = 0;
     self->hdr_lines = 0;
     self->hdr_in_fields = 0;
-    self->scan_from = 0;
     self->trailer_count = 0;
 
     Py_XDECREF(self->py_method);
