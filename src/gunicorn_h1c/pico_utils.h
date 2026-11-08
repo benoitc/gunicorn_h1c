@@ -869,16 +869,104 @@ pico_find_request_line_length(const char *buf, size_t buf_len)
 }
 
 /*
+ * Size of a header line as gunicorn's Python parsers count it: the line as
+ * received, whitespace around the value included, plus CRLF. Only valid on a
+ * header parsed by picohttpparser, whose line is followed by CRLF.
+ */
+static inline size_t
+pico_header_line_size(const struct phr_header *h)
+{
+    if (h->name == NULL) {
+        return h->value_len + 4;  /* folded line, rejected right after */
+    }
+    const char *end = h->value + h->value_len;
+    while (*end == ' ' || *end == '\t') {
+        end++;
+    }
+    return (size_t)(end - h->name) + 2;
+}
+
+/*
+ * Quick checks of one complete line, without its CRLF, for H1CProtocol,
+ * which validates each line of the head as it arrives. They accept exactly
+ * what picohttpparser accepts; on a line they refuse,
+ * pico_analyze_parse_error() gives the class and message.
+ */
+static inline int
+pico_request_line_ok(const char *line, size_t len,
+                     const char **method, size_t *method_len,
+                     const char **target, size_t *target_len,
+                     int *minor_version)
+{
+    const unsigned char *p = (const unsigned char *)line;
+    const unsigned char *end = p + len;
+
+    *method = (const char *)p;
+    while (p < end && *p != ' ') {
+        if (!pico_is_token_char(*p)) return 0;
+        p++;
+    }
+    *method_len = (size_t)((const char *)p - *method);
+    if (*method_len == 0 || p >= end) return 0;
+    while (p < end && *p == ' ') p++;
+
+    *target = (const char *)p;
+    while (p < end && *p != ' ') {
+        if (*p < 0x20 || *p == 0x7f) return 0;
+        p++;
+    }
+    *target_len = (size_t)((const char *)p - *target);
+    if (*target_len == 0 || p >= end) return 0;
+    while (p < end && *p == ' ') p++;
+
+    if (end - p != 8 || memcmp(p, "HTTP/1.", 7) != 0 ||
+        p[7] < '0' || p[7] > '9') {
+        return 0;
+    }
+    *minor_version = p[7] - '0';
+    return 1;
+}
+
+static inline int
+pico_header_line_ok(const char *line, size_t len)
+{
+    const unsigned char *p = (const unsigned char *)line;
+    const unsigned char *end = p + len;
+
+    const unsigned char *name = p;
+    while (p < end && *p != ':') {
+        if (!pico_is_token_char(*p)) return 0;
+        p++;
+    }
+    if (p == name || p >= end) return 0;
+    for (p++; p < end; p++) {
+        if (*p < 0x20 ? *p != '\t' : *p == 0x7f) return 0;
+    }
+    return 1;
+}
+
+/*
  * Analyze buffer when phr_parse_request returns -1 and set specific exception.
  * Returns -1 (always sets an exception).
  *
- * Analysis order:
- * 1. Find method and validate characters
- * 2. Find HTTP version and validate
- * 3. Scan headers for invalid characters
- * 4. Bare LF or bare CR used as a line terminator
- * 5. Fallback to generic ParseError
+ * The buffer is walked left to right with picohttpparser's grammar, and the
+ * error is classified by where the first offending byte sits: method,
+ * request-target, version, header name, header value or line terminator.
+ *
+ * picohttpparser rejects a request as soon as it reaches that byte, so the
+ * caller may hold anything from the bytes up to it to the whole request,
+ * depending on how the reads were split. The walk therefore never looks past
+ * the offending byte, except where picohttpparser itself waits for more
+ * data (the byte after a CR, the nine bytes of the version), so the same
+ * bytes always give the same exception and message.
  */
+#define PICO_ERR_BARE_LF \
+    "Bare LF as line terminator, CRLF required (RFC 9112 section 2.2)"
+#define PICO_ERR_BARE_CR "Bare CR in request head (RFC 9112 section 2.2)"
+#define PICO_ERR_GENERIC "Invalid HTTP request"
+#define PICO_ERR_VERSION \
+    "Invalid HTTP version (only HTTP/1.0 and HTTP/1.1 allowed)"
+
 static inline int
 pico_analyze_parse_error(const char *buf, size_t buf_len,
                          int permit_unconventional_method,
@@ -889,187 +977,158 @@ pico_analyze_parse_error(const char *buf, size_t buf_len,
                          PyObject *InvalidHeaderName,
                          PyObject *InvalidHeader)
 {
-    /* 1. Find and validate method (before first space) */
-    size_t method_end = 0;
-    for (size_t i = 0; i < buf_len; i++) {
-        if (buf[i] == ' ') {
-            method_end = i;
-            break;
-        }
+    const unsigned char *p = (const unsigned char *)buf;
+    const unsigned char *end = p + buf_len;
+
+#define PICO_FAIL(exc, msg) \
+    do { PyErr_SetString((exc), (msg)); return -1; } while (0)
+
+    /* One empty line before the request line is ignored */
+    if (p + 1 < end && p[0] == '\r' && p[1] == '\n') {
+        p += 2;
     }
 
-    if (method_end > 0) {
-        /* Check method for invalid chars */
-        for (size_t i = 0; i < method_end; i++) {
-            unsigned char c = (unsigned char)buf[i];
-            if (!pico_is_token_char(c)) {
-                PyErr_Format(InvalidRequestMethod,
-                    "Invalid character '\\x%02x' in HTTP method", c);
-                return -1;
-            }
-            if (!permit_unconventional_method && c >= 'a' && c <= 'z') {
-                PyErr_SetString(InvalidRequestMethod,
-                    "Lowercase letters not allowed in HTTP method");
-                return -1;
-            }
+    /* Method: a token, ended by SP. A CR or LF here ends the line before
+     * the request line is complete. */
+    const unsigned char *method = p;
+    for (; p < end && *p != ' '; p++) {
+        unsigned char c = *p;
+        /* A CR ends the line before the method does, except a bare CR at the
+         * very start: picohttpparser waits for the byte after it there, and
+         * it is then just an invalid method character. */
+        if (c == '\r' && !(p == (const unsigned char *)buf && p + 1 < end &&
+                             p[1] != '\n')) {
+            PICO_FAIL(ParseError, PICO_ERR_GENERIC);
+        }
+        if (c == '\n') {
+            PICO_FAIL(ParseError, PICO_ERR_BARE_LF);
+        }
+        if (!pico_is_token_char(c)) {
+            PyErr_Format(InvalidRequestMethod,
+                "Invalid character '\\x%02x' in HTTP method", c);
+            return -1;
+        }
+        if (!permit_unconventional_method && c >= 'a' && c <= 'z') {
+            PICO_FAIL(InvalidRequestMethod,
+                "Lowercase letters not allowed in HTTP method");
         }
     }
+    if (p >= end) goto fallback;
+    size_t method_len = (size_t)(p - method);
+    while (p < end && *p == ' ') p++;
 
-    /* 2. Find and validate HTTP version (after path, look for "HTTP/") */
-    const char *http_marker = NULL;
-    for (size_t i = 0; i + 5 <= buf_len; i++) {
-        if (buf[i] == 'H' && buf[i+1] == 'T' && buf[i+2] == 'T' &&
-            buf[i+3] == 'P' && buf[i+4] == '/') {
-            http_marker = &buf[i];
-            break;
+    /* Request-target: up to SP, no control characters */
+    const unsigned char *target = p;
+    for (; p < end && *p != ' '; p++) {
+        unsigned char c = *p;
+        if (c < 0x20 || c == 0x7f) {
+            PICO_FAIL(ParseError, c == '\n' ? PICO_ERR_BARE_LF : PICO_ERR_GENERIC);
         }
     }
-
-    if (http_marker && !permit_unconventional_version) {
-        /* Check if it's HTTP/1.0 or HTTP/1.1 */
-        size_t remaining = buf_len - (http_marker - buf);
-        if (remaining >= 8) {
-            /* HTTP/X.Y followed by \r or end */
-            char major = http_marker[5];
-            char dot = http_marker[6];
-            char minor = http_marker[7];
-            if (major != '1' || dot != '.' || (minor != '0' && minor != '1')) {
-                PyErr_SetString(InvalidHTTPVersion,
-                    "Invalid HTTP version (only HTTP/1.0 and HTTP/1.1 allowed)");
-                return -1;
-            }
-        }
+    if (p >= end) goto fallback;
+    size_t target_len = (size_t)(p - target);
+    while (p < end && *p == ' ') p++;
+    if (method_len == 0 || target_len == 0) {
+        PICO_FAIL(ParseError, PICO_ERR_GENERIC);
     }
 
-    /* Check for non-HTTP protocol markers (e.g., FTP/1.1) */
-    if (!http_marker && !permit_unconventional_version) {
-        /* Find second space (after path) to locate version field */
-        size_t second_space = 0;
-        int space_count = 0;
-        for (size_t i = 0; i < buf_len && i < 8192; i++) {
-            if (buf[i] == ' ') {
-                space_count++;
-                if (space_count == 2) {
-                    second_space = i;
-                    break;
+    /* Version: picohttpparser reads nine bytes ("HTTP/1.x" and the byte
+     * after it) before it decides, so the same nine are used here. */
+    if (end - p < 9) goto fallback;
+    if (memcmp(p, "HTTP/", 5) == 0) {
+        if (!permit_unconventional_version &&
+            (p[5] != '1' || p[6] != '.' || (p[7] != '0' && p[7] != '1'))) {
+            PICO_FAIL(InvalidHTTPVersion, PICO_ERR_VERSION);
+        }
+        if (memcmp(p, "HTTP/1.", 7) != 0 || p[7] < '0' || p[7] > '9') {
+            PICO_FAIL(ParseError, PICO_ERR_GENERIC);
+        }
+    } else {
+        if (!permit_unconventional_version) {
+            for (int i = 0; i < 9 && p[i] != '\r' && p[i] != '\n'; i++) {
+                if (p[i] == '/') {
+                    PICO_FAIL(InvalidHTTPVersion, PICO_ERR_VERSION);
                 }
             }
-            if (buf[i] == '\r' || buf[i] == '\n') break;
         }
+        PICO_FAIL(ParseError, PICO_ERR_GENERIC);
+    }
+    p += 8;
+    if (*p == '\n') {
+        PICO_FAIL(ParseError, PICO_ERR_BARE_LF);
+    }
+    if (*p != '\r') {
+        PICO_FAIL(ParseError, PICO_ERR_GENERIC);
+    }
+    if (p + 1 >= end) goto fallback;
+    if (p[1] != '\n') {
+        PICO_FAIL(ParseError, PICO_ERR_BARE_CR);
+    }
+    p += 2;
 
-        if (second_space > 0 && second_space + 1 < buf_len) {
-            /* Check if there's something after second space that looks like a version */
-            const char *ver_start = &buf[second_space + 1];
-            size_t ver_remaining = buf_len - second_space - 1;
-            /* Look for X/X.X pattern but not HTTP/ */
-            if (ver_remaining >= 3) {
-                /* If it starts with letters and has a '/', it's a protocol version */
-                int has_slash = 0;
-                for (size_t i = 0; i < ver_remaining && i < 10; i++) {
-                    if (ver_start[i] == '/') { has_slash = 1; break; }
-                    if (ver_start[i] == '\r' || ver_start[i] == '\n') break;
+    /* Header lines, until the empty line that ends the head */
+    for (size_t n = 0; p < end; n++) {
+        if (*p == '\r') {
+            if (p + 1 >= end) goto fallback;
+            if (p[1] != '\n') {
+                PICO_FAIL(ParseError, PICO_ERR_BARE_CR);
+            }
+            goto fallback;  /* end of the head, nothing found */
+        }
+        if (*p == '\n') {
+            PICO_FAIL(ParseError, PICO_ERR_BARE_LF);
+        }
+        if (n == 256) goto fallback;  /* MAX_HEADERS */
+
+        if (!(n != 0 && (*p == ' ' || *p == '\t'))) {
+            /* Field name: a token, ended by ':' */
+            const unsigned char *name = p;
+            for (; p < end && *p != ':'; p++) {
+                unsigned char c = *p;
+                if (c == '\r') {
+                    PICO_FAIL(ParseError, PICO_ERR_GENERIC);
                 }
-                if (has_slash) {
-                    PyErr_SetString(InvalidHTTPVersion,
-                        "Invalid HTTP version (only HTTP/1.0 and HTTP/1.1 allowed)");
+                if (c == '\n') {
+                    PICO_FAIL(ParseError, PICO_ERR_BARE_LF);
+                }
+                if (!pico_is_token_char(c)) {
+                    PyErr_Format(InvalidHeaderName,
+                        "Invalid character '\\x%02x' in header name", c);
                     return -1;
                 }
             }
+            if (p >= end) goto fallback;
+            if (p == name) {
+                PICO_FAIL(ParseError, PICO_ERR_GENERIC);
+            }
+            p++;  /* ':' */
+            while (p < end && (*p == ' ' || *p == '\t')) p++;
         }
-    }
 
-    /* 3. Find and scan headers (after first \r\n) */
-    const char *headers_start = NULL;
-    for (size_t i = 0; i + 1 < buf_len; i++) {
-        if (buf[i] == '\r' && buf[i+1] == '\n') {
-            headers_start = &buf[i + 2];
-            break;
-        }
-    }
-
-    if (headers_start) {
-        size_t headers_len = buf_len - (headers_start - buf);
-        const char *p = headers_start;
-        const char *end = headers_start + headers_len;
-
-        while (p < end) {
-            /* Find colon (end of header name) */
-            const char *colon = NULL;
-            const char *line_end = NULL;
-
-            for (const char *q = p; q < end; q++) {
-                if (*q == ':' && !colon) colon = q;
-                if (q + 1 < end && *q == '\r' && *(q+1) == '\n') {
-                    line_end = q;
-                    break;
-                }
+        /* Field value, up to CRLF (RFC 9110 section 5.5 field-vchar) */
+        for (; p < end; p++) {
+            unsigned char c = *p;
+            if (c == '\r') {
+                if (p + 1 >= end) goto fallback;
+                if (p[1] == '\n') break;
+            } else if (c >= 0x20 && c != 0x7f) {
+                continue;
+            } else if (c == '\t') {
+                continue;
             }
-
-            if (!line_end) break;  /* Incomplete */
-
-            /* Empty line = end of headers */
-            if (p == line_end) break;
-
-            /* Validate header name */
-            if (colon && colon > p) {
-                for (const char *q = p; q < colon; q++) {
-                    unsigned char c = (unsigned char)*q;
-                    if (!pico_is_token_char(c)) {
-                        PyErr_Format(InvalidHeaderName,
-                            "Invalid character '\\x%02x' in header name", c);
-                        return -1;
-                    }
-                }
-            }
-
-            /* Validate header value: RFC 9110 section 5.5 field-vchar. */
-            if (colon && colon + 1 < line_end) {
-                const char *value_start = colon + 1;
-                while (value_start < line_end &&
-                       (*value_start == ' ' || *value_start == '\t')) {
-                    value_start++;
-                }
-                for (const char *q = value_start; q < line_end; q++) {
-                    unsigned char c = (unsigned char)*q;
-                    if (c <= 0x08 || (c >= 0x0A && c <= 0x1F) || c == 0x7F) {
-                        PyErr_Format(InvalidHeader,
-                            "Invalid control character '\\x%02x' in header value", c);
-                        return -1;
-                    }
-                }
-            }
-
-            p = line_end + 2;  /* Skip \r\n */
-        }
-    }
-
-    /* 4. Lines end with CRLF only. RFC 9112 section 2.2 allows a recipient
-     * to accept a bare LF; we do not, and a bare CR is always invalid. Only
-     * the head is checked: the scan stops at the empty line that ends it. */
-    size_t line_start = 0;
-    for (size_t i = 0; i < buf_len; i++) {
-        if (buf[i] == '\n') {
-            if (i == 0 || buf[i - 1] != '\r') {
-                PyErr_SetString(ParseError,
-                    "Bare LF as line terminator, CRLF required "
-                    "(RFC 9112 section 2.2)");
-                return -1;
-            }
-            /* empty line: end of head, unless it is the one leading CRLF */
-            if (i - 1 == line_start && line_start != 0) {
-                break;
-            }
-            line_start = i + 1;
-        } else if (buf[i] == '\r' && i + 1 < buf_len && buf[i + 1] != '\n') {
-            PyErr_SetString(ParseError,
-                "Bare CR in request head (RFC 9112 section 2.2)");
+            PyErr_Format(InvalidHeader,
+                "Invalid control character '\\x%02x' in header value", c);
             return -1;
         }
+        if (p >= end) goto fallback;
+        p += 2;  /* CRLF */
     }
 
-    /* Fallback to generic error */
-    PyErr_SetString(ParseError, "Invalid HTTP request");
+fallback:
+    PyErr_SetString(ParseError, PICO_ERR_GENERIC);
     return -1;
+
+#undef PICO_FAIL
 }
 
 /*
@@ -1084,21 +1143,22 @@ pico_validate_headers_full(struct phr_header *headers, size_t num_headers,
                            PyObject *InvalidHeaderName,
                            PyObject *InvalidHeader)
 {
-    /* Check header count */
-    if ((Py_ssize_t)num_headers > config->limit_request_fields) {
-        PyErr_Format(LimitRequestHeaders,
-            "Number of headers (%zu) exceeds limit (%zd)",
-            num_headers, config->limit_request_fields);
-        return -1;
-    }
-
     for (size_t i = 0; i < num_headers; i++) {
-        /* Check header line size (name + ": " + value + CRLF) */
-        size_t header_size = headers[i].name_len + 2 + headers[i].value_len + 2;
+        /* Line by line, in the order gunicorn's ASGI parser checks them:
+         * size, count, then content. The size is the line as received,
+         * whitespace included, plus CRLF, as gunicorn counts it. */
+        size_t header_size = pico_header_line_size(&headers[i]);
         if ((Py_ssize_t)header_size > config->limit_request_field_size) {
             PyErr_Format(LimitRequestHeaders,
                 "Header size (%zu) exceeds limit (%zd)",
                 header_size, config->limit_request_field_size);
+            return -1;
+        }
+
+        if ((Py_ssize_t)(i + 1) > config->limit_request_fields) {
+            PyErr_Format(LimitRequestHeaders,
+                "Number of headers (%zu) exceeds limit (%zd)",
+                num_headers, config->limit_request_fields);
             return -1;
         }
 
@@ -1145,21 +1205,22 @@ pico_validate_headers(struct phr_header *headers, size_t num_headers,
                       PyObject *InvalidHeaderName,
                       PyObject *InvalidHeader)
 {
-    /* Check header count */
-    if ((Py_ssize_t)num_headers > config->limit_request_fields) {
-        PyErr_Format(LimitRequestHeaders,
-            "Number of headers (%zu) exceeds limit (%zd)",
-            num_headers, config->limit_request_fields);
-        return -1;
-    }
-
     for (size_t i = 0; i < num_headers; i++) {
-        /* Check header line size (name + ": " + value + CRLF) */
-        size_t header_size = headers[i].name_len + 2 + headers[i].value_len + 2;
-        if ((Py_ssize_t)header_size > config->limit_request_field_size) {
+        /* Same checks, order and messages as H1CProtocol applies to each
+         * line while the head is still arriving, so the result does not
+         * depend on how the request was split. */
+        if ((Py_ssize_t)pico_header_line_size(&headers[i]) >
+                config->limit_request_field_size) {
             PyErr_Format(LimitRequestHeaders,
-                "Header size (%zu) exceeds limit (%zd)",
-                header_size, config->limit_request_field_size);
+                "Header size exceeds limit (%zd)",
+                config->limit_request_field_size);
+            return -1;
+        }
+
+        if ((Py_ssize_t)(i + 1) > config->limit_request_fields) {
+            PyErr_Format(LimitRequestHeaders,
+                "Number of headers exceeds limit (%zd)",
+                config->limit_request_fields);
             return -1;
         }
 

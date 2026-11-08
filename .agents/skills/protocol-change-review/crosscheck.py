@@ -94,11 +94,7 @@ CASES = {
 
 # Differences already reviewed, with the reason. They are reported but do not
 # fail the run. Remove an entry once gunicorn's parsers are changed.
-KNOWN_DIFFERENCES = {
-    # RFC 9112 section 2.2: a server SHOULD ignore at least one empty line
-    # before the request line. gunicorn's Python parsers reject it.
-    "leading CRLF": "gunicorn_h1c follows RFC 9112 section 2.2",
-}
+KNOWN_DIFFERENCES = {}
 
 # Byte-by-byte runs of these only repeat the whole run, slowly.
 SKIP_BYTEWISE = {
