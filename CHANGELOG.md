@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.12] - 2026-11-09
+
+### Fixed
+
+- Chunked request bodies no longer slow down with their size. The cost grew
+  with the square of the body: a 64 KiB chunked body read in one go took
+  about 23 times longer than the same body with `Content-Length`, and 4096
+  small chunks took 5 ms. A chunked body now takes at most about twice as
+  long as the same body with `Content-Length`.
+- `parse_request`, `parse_request_fast`, `parse_to_wsgi_environ` and
+  `parse_to_asgi_scope` measure the request line after the one empty line
+  allowed before it, as `H1CProtocol` and gunicorn do. A request line over
+  `limit_request_line` used to be accepted when a CRLF came before it.
+
+### Changed
+
+- Faster parsing. `H1CProtocol` reads a request straight from the bytes
+  given to `feed()` and copies only what it has to keep, so a body that
+  arrives with the head is no longer copied. Header names and values are not
+  checked a second time after parsing, and `asgi_headers` shares its values
+  with `headers` instead of copying them. In gunicorn this cuts the parser's
+  work per request by about 20% on the ASGI worker and 15% on the WSGI
+  worker, and the work for a 64 KiB body by about 60%.
+- `H1CProtocol` calls `on_body` once per `feed()` with all the chunk data
+  that call decoded, instead of once per chunk, the same way a
+  `Content-Length` body arrives. Code that relied on one call per chunk sees
+  fewer, larger calls. Data decoded before an invalid chunk is still
+  delivered before the error.
+
 ## [0.6.11] - 2026-11-08
 
 ### Fixed
