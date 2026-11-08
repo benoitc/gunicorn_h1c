@@ -2,6 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.11] - 2026-11-08
+
+### Fixed
+
+- Report the same error for the same invalid request however its bytes
+  arrive. When `parse_request` or `parse_request_fast` was called with only
+  part of the request (as gunicorn's WSGI worker does while it reads, with
+  `last_len`), or `H1CProtocol` was fed it in pieces, the error was often a
+  generic `ParseError` where parsing the whole request gave `InvalidHeader`,
+  `InvalidHeaderName` or `InvalidRequestMethod`. In gunicorn that turned some
+  bad header lines into `InvalidRequestLine` depending on where the socket
+  read happened to stop. The error now depends only on the first invalid byte
+  and where it sits in the request.
+- `H1CProtocol` gives the same message for a request line, a header line or a
+  header count over its limit whether the request arrived whole or in pieces.
+
+### Changed
+
+- `H1CProtocol` limit messages no longer include the measured length or
+  count, since it is not known yet when a line is cut short: for example
+  "Number of headers exceeds limit (100)" instead of "Number of headers (150)
+  exceeds limit (100)". The exception classes are unchanged.
+- A few malformed requests get a different class than a full parse gave
+  before, now that the first invalid byte decides. A bare LF at the start of
+  a header line or in the method, or a second empty line before the request
+  line, is a `ParseError`; a bare LF or CR inside a header value is an
+  `InvalidHeader`. Nothing that was accepted is rejected, or the reverse.
+- Code that caught `gunicorn_h1c._protocol.ParseError` or
+  `gunicorn_h1c._parser_fast.ParseError` for these requests now gets the
+  specific class. Every specific class derives from `gunicorn_h1c.ParseError`
+  and from `ValueError`; catch one of those to handle every rejection.
+
 ## [0.6.10] - 2026-11-07
 
 ### Security
