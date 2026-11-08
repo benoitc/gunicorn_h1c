@@ -134,6 +134,11 @@ machine, and report medians with the spread.
 - `tests/`: pytest suite; `tests/test_security_review.py` runs crash cases
   in a child interpreter so a regression fails the test instead of killing
   the run.
+- `tests/test_error_split.py`: replays every input the suite rejects
+  (`tests/data/invalid_corpus.py`) at every split point and checks the error
+  matches a parse of the whole input. Regenerate the corpus after adding
+  invalid cases:
+  `H1C_CORPUS=tests/data/invalid_corpus.py PYTHONPATH=tests:src pytest -p record_invalid_corpus tests/ --ignore=tests/test_error_split.py`.
 - `benchmarks/bench_protocol.py`: throughput of the callback and pull APIs.
 
 ## Memory safety

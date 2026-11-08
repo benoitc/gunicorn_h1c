@@ -563,14 +563,12 @@ H1CProtocol_scan_head(H1CProtocol *self)
             size_t pending = self->buffer_len - self->hdr_line_start;
             if (!self->hdr_in_fields && pending > line_limit + 1) {
                 PyErr_Format(LimitRequestLine,
-                    "Request line over %zu bytes with no terminator",
-                    line_limit);
+                    "Request line exceeds limit (%zu)", line_limit);
                 return -1;
             }
             if (self->hdr_in_fields && pending > field_limit + 1) {
                 PyErr_Format(LimitRequestHeaders,
-                    "Request header field over %zu bytes with no terminator",
-                    field_limit);
+                    "Header size exceeds limit (%zu)", field_limit);
                 return -1;
             }
             self->hdr_scan = self->buffer_len;
@@ -595,8 +593,7 @@ H1CProtocol_scan_head(H1CProtocol *self)
             }
             if ((Py_ssize_t)line_len > self->limit_request_line) {
                 PyErr_Format(LimitRequestLine,
-                    "Request line length (%zu) exceeds limit (%zd)",
-                    line_len, self->limit_request_line);
+                    "Request line exceeds limit (%zd)", self->limit_request_line);
                 return -1;
             }
             self->hdr_in_fields = 1;
@@ -606,8 +603,8 @@ H1CProtocol_scan_head(H1CProtocol *self)
             self->hdr_lines++;
             if (self->hdr_lines > self->limit_request_fields) {
                 PyErr_Format(LimitRequestHeaders,
-                    "Number of headers (%zd) exceeds limit (%zd)",
-                    self->hdr_lines, self->limit_request_fields);
+                    "Number of headers exceeds limit (%zd)",
+                    self->limit_request_fields);
                 return -1;
             }
         }
@@ -645,8 +642,7 @@ H1CProtocol_feed_headers(H1CProtocol *self)
             Py_ssize_t line_len = eol ? (Py_ssize_t)(eol - method) : 0;
             if (line_len > self->limit_request_line) {
                 PyErr_Format(LimitRequestLine,
-                    "Request line length (%zd) exceeds limit (%zd)",
-                    line_len, self->limit_request_line);
+                    "Request line exceeds limit (%zd)", self->limit_request_line);
                 return -1;
             }
         }
@@ -986,7 +982,7 @@ H1CProtocol_feed_body_chunked(H1CProtocol *self)
             }
             if (idx == -3) {
                 PyErr_Format(ParseError,
-                    "chunk size line over %zu bytes with no terminator",
+                    "chunk size line over %zu bytes",
                     H1CProtocol_line_limit(self));
                 return -1;
             }
@@ -1133,7 +1129,7 @@ H1CProtocol_feed_body_chunked(H1CProtocol *self)
             }
             if (idx == -3) {
                 PyErr_Format(LimitRequestHeaders,
-                    "Request trailer field over %zu bytes with no terminator",
+                    "Request trailer field over %zu bytes",
                     H1CProtocol_line_limit(self));
                 return -1;
             }
