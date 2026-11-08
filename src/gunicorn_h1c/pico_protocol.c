@@ -1686,17 +1686,50 @@ H1CProtocol_get_asgi_headers_impl(H1CProtocol *self, void *closure)
                 return NULL;
             }
 
+            /* bytes are immutable, so the value object is shared with
+             * `headers`, and so is the name when it has no capital: only
+             * names that need lowering are copied. */
             const char *name_str = PyBytes_AS_STRING(name);
             Py_ssize_t name_len = PyBytes_GET_SIZE(name);
-
-            PyObject *pair = pico_create_header_tuple_lowercase(
-                name_str, name_len,
-                PyBytes_AS_STRING(value), PyBytes_GET_SIZE(value));
+            Py_ssize_t j = 0;
+            while (j < name_len && !(name_str[j] >= 'A' && name_str[j] <= 'Z')) {
+                j++;
+            }
+            PyObject *lower;
+            if (j == name_len && PyBytes_CheckExact(name)) {
+                lower = name;
+                Py_INCREF(lower);
+            } else {
+                lower = PyBytes_FromStringAndSize(NULL, name_len);
+                if (lower) {
+                    char *dst = PyBytes_AS_STRING(lower);
+                    for (Py_ssize_t k = 0; k < name_len; k++) {
+                        char c = name_str[k];
+                        dst[k] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+                    }
+                }
+            }
+            PyObject *pair = lower ? PyTuple_New(2) : NULL;
             if (!pair) {
+                Py_XDECREF(lower);
                 Py_DECREF(out);
                 Py_DECREF(src);
                 return NULL;
             }
+            PyTuple_SET_ITEM(pair, 0, lower);
+            if (PyBytes_CheckExact(value)) {
+                Py_INCREF(value);
+            } else {
+                value = PyBytes_FromStringAndSize(PyBytes_AS_STRING(value),
+                                                  PyBytes_GET_SIZE(value));
+                if (!value) {
+                    Py_DECREF(pair);
+                    Py_DECREF(out);
+                    Py_DECREF(src);
+                    return NULL;
+                }
+            }
+            PyTuple_SET_ITEM(pair, 1, value);
             PyList_SET_ITEM(out, i, pair);
         }
         Py_DECREF(src);
