@@ -786,3 +786,30 @@ class TestProtocolParseErrorSpecificExceptions:
         protocol = gunicorn_h1c.H1CProtocol(on_headers_complete=lambda: None)
         with pytest.raises(InvalidHTTPVersion):
             protocol.feed(b"GET / FTP/1.1\r\n\r\n")
+
+
+class TestRequestLineLimitAfterLeadingCRLF:
+    """The request line is measured after the one empty line that may come
+    before it, as H1CProtocol and gunicorn's parsers measure it."""
+
+    LINE = b"GET /" + b"a" * 200 + b" HTTP/1.1"
+
+    @pytest.mark.parametrize(
+        "func", [parse_request, parse_request_fast], ids=["parse", "fast"]
+    )
+    def test_long_line_after_leading_crlf_is_rejected(self, func):
+        with pytest.raises(LimitRequestLine):
+            func(b"\r\n" + self.LINE + b"\r\nHost: a\r\n\r\n", limit_request_line=100)
+
+    @pytest.mark.parametrize(
+        "func", [parse_request, parse_request_fast], ids=["parse", "fast"]
+    )
+    def test_short_line_after_leading_crlf_is_fine(self, func):
+        func(b"\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n", limit_request_line=100)
+
+    def test_protocol_agrees(self):
+        from gunicorn_h1c import H1CProtocol
+
+        p = H1CProtocol(limit_request_line=100)
+        with pytest.raises(LimitRequestLine):
+            p.feed(b"\r\n" + self.LINE + b"\r\nHost: a\r\n\r\n")

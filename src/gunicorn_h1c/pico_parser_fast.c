@@ -331,16 +331,6 @@ pico_parse_request_fast(PyObject *self, PyObject *args, PyObject *kwargs)
         return NULL;
     }
 
-    /* Check request line length before parsing */
-    Py_ssize_t req_line_len = pico_find_request_line_length(req->view.buf, req->view.len);
-    if (req_line_len >= 0 && req_line_len > limit_request_line) {
-        Py_DECREF(req);
-        PyErr_Format(LimitRequestLine,
-            "Request line length (%zd) exceeds limit (%zd)",
-            req_line_len, limit_request_line);
-        return NULL;
-    }
-
     /* Keep reference to original buffer */
     Py_INCREF(data);
     req->buffer = data;
@@ -355,6 +345,13 @@ pico_parse_request_fast(PyObject *self, PyObject *args, PyObject *kwargs)
         req->headers, &req->num_headers,
         (size_t)last_len
     );
+
+    if (pico_check_request_line(req->view.buf, req->view.len, ret,
+                                req->method, req->path, req->path_len,
+                                limit_request_line, LimitRequestLine) < 0) {
+        Py_DECREF(req);
+        return NULL;
+    }
 
     if (ret == -2) {
         Py_DECREF(req);
