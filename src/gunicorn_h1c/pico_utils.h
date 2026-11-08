@@ -768,49 +768,6 @@ pico_validate_version(int minor_version, int permit_unconventional,
 }
 
 /*
- * Validate header name.
- * Returns 0 on success, -1 on error (sets Python exception).
- *
- * All characters must be RFC 9110 token chars.
- */
-static inline int
-pico_validate_header_name(const char *name, size_t name_len,
-                          PyObject *InvalidHeaderName)
-{
-    for (size_t i = 0; i < name_len; i++) {
-        unsigned char c = (unsigned char)name[i];
-        if (!pico_is_token_char(c)) {
-            PyErr_Format(InvalidHeaderName,
-                "Invalid character '\\x%02x' in header name", c);
-            return -1;
-        }
-    }
-    return 0;
-}
-
-/*
- * Validate header value.
- * Returns 0 on success, -1 on error (sets Python exception).
- *
- * RFC 9110 section 5.5: field-vchar = VCHAR / obs-text; plus SP / HTAB.
- * Any other control byte (0x00-0x08, 0x0A-0x1F, 0x7F) is invalid.
- */
-static inline int
-pico_validate_header_value(const char *value, size_t value_len,
-                           PyObject *InvalidHeader)
-{
-    for (size_t i = 0; i < value_len; i++) {
-        unsigned char c = (unsigned char)value[i];
-        if (c <= 0x08 || (c >= 0x0A && c <= 0x1F) || c == 0x7F) {
-            PyErr_Format(InvalidHeader,
-                "Invalid control character '\\x%02x' in header value", c);
-            return -1;
-        }
-    }
-    return 0;
-}
-
-/*
  * Release the input buffer only once the return value is built: the parsed
  * fields point into it, and an exporter may move or free that memory when
  * the view is released.
@@ -854,18 +811,54 @@ pico_has_obs_fold(const struct phr_header *headers, size_t num_headers)
 }
 
 /*
- * Calculate request line length by finding first CRLF.
- * Returns length or -1 if not found.
+ * Length of the request line in a buffer that may not hold a whole request:
+ * up to its CRLF, after the one empty line picohttpparser ignores before it.
+ * Returns -1 when the line has no CRLF yet.
  */
 static inline Py_ssize_t
 pico_find_request_line_length(const char *buf, size_t buf_len)
 {
-    for (size_t i = 0; i + 1 < buf_len; i++) {
-        if (buf[i] == '\r' && buf[i + 1] == '\n') {
-            return (Py_ssize_t)i;
+    size_t start = (buf_len >= 2 && buf[0] == '\r' && buf[1] == '\n') ? 2 : 0;
+    const char *p = buf + start;
+    const char *end = buf + buf_len;
+    while (p < end) {
+        const char *cr = memchr(p, '\r', (size_t)(end - p));
+        if (!cr || cr + 1 >= end) {
+            return -1;
         }
+        if (cr[1] == '\n') {
+            return (Py_ssize_t)(cr - (buf + start));
+        }
+        p = cr + 1;
     }
     return -1;
+}
+
+/*
+ * Check the request line against limit_request_line once picohttpparser has
+ * run. A successful parse gives its bounds, so the line is not scanned
+ * again; an incomplete or failed one is searched, so a request line that is
+ * already too long is reported first, whatever follows it.
+ */
+static inline int
+pico_check_request_line(const char *buf, size_t buf_len, int ret,
+                        const char *method, const char *path, size_t path_len,
+                        Py_ssize_t limit, PyObject *LimitRequestLine)
+{
+    Py_ssize_t line_len;
+    if (ret > 0) {
+        const char *eol = memchr(path + path_len, '\r',
+                                 (size_t)((buf + ret) - (path + path_len)));
+        line_len = eol ? (Py_ssize_t)(eol - method) : 0;
+    } else {
+        line_len = pico_find_request_line_length(buf, buf_len);
+    }
+    if (line_len >= 0 && line_len > limit) {
+        PyErr_Format(LimitRequestLine,
+            "Request line length (%zd) exceeds limit (%zd)", line_len, limit);
+        return -1;
+    }
+    return 0;
 }
 
 /*
@@ -1171,17 +1164,8 @@ pico_validate_headers_full(struct phr_header *headers, size_t num_headers,
             return -1;
         }
 
-        /* Validate header name */
-        if (pico_validate_header_name(headers[i].name, headers[i].name_len,
-                                       InvalidHeaderName) < 0) {
-            return -1;
-        }
-
-        /* Validate header value */
-        if (pico_validate_header_value(headers[i].value, headers[i].value_len,
-                                        InvalidHeader) < 0) {
-            return -1;
-        }
+        /* Names and values need no second look: picohttpparser already
+         * refused every byte the name and value rules exclude. */
     }
 
     /* Extract header info and validate framing for request smuggling prevention */
@@ -1233,17 +1217,8 @@ pico_validate_headers(struct phr_header *headers, size_t num_headers,
             return -1;
         }
 
-        /* Validate header name */
-        if (pico_validate_header_name(headers[i].name, headers[i].name_len,
-                                       InvalidHeaderName) < 0) {
-            return -1;
-        }
-
-        /* Validate header value */
-        if (pico_validate_header_value(headers[i].value, headers[i].value_len,
-                                        InvalidHeader) < 0) {
-            return -1;
-        }
+        /* Names and values need no second look: picohttpparser already
+         * refused every byte the name and value rules exclude. */
     }
 
     return 0;

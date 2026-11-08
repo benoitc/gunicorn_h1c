@@ -1484,3 +1484,19 @@ class TestHeadErrorOrder:
         data = b"GET / HTTP/1.2\r\nX-B: " + b"b" * 200 + b"\r\n\r\n"
         with pytest.raises(InvalidHTTPVersion):
             feed_all(p, data, bytewise)
+
+
+class TestAsgiHeadersSharing:
+    """asgi_headers shares the value objects of headers, and the name when
+    it is already lowercase; only names with capitals are copied."""
+
+    def test_values_are_shared(self):
+        p = H1CProtocol()
+        p.feed(b"GET / HTTP/1.1\r\nHost: a\r\nx-lower: 1\r\nX-Mixed: 2\r\n\r\n")
+        headers = p.headers
+        asgi = p.asgi_headers
+        assert asgi == [(b"host", b"a"), (b"x-lower", b"1"), (b"x-mixed", b"2")]
+        for (name, value), (aname, avalue) in zip(headers, asgi):
+            assert avalue is value
+            if name == name.lower():
+                assert aname is name

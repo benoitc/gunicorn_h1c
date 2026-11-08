@@ -61,8 +61,8 @@ Fixes go into the latest release only. Upgrade to it before you report.
 
 | Version  | Status             |
 | -------- | ------------------ |
-| 0.6.11   | :white_check_mark: |
-| < 0.6.11 | :x:                |
+| 0.6.12   | :white_check_mark: |
+| < 0.6.12 | :x:                |
 
 ## Python versions
 

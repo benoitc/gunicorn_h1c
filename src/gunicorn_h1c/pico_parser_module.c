@@ -73,16 +73,6 @@ pico_parse_request(PyObject *self, PyObject *args, PyObject *kwargs)
         return NULL;
     }
 
-    /* Check request line length before parsing */
-    Py_ssize_t req_line_len = pico_find_request_line_length(buf.buf, buf.len);
-    if (req_line_len >= 0 && req_line_len > limit_request_line) {
-        PyBuffer_Release(&buf);
-        PyErr_Format(LimitRequestLine,
-            "Request line length (%zd) exceeds limit (%zd)",
-            req_line_len, limit_request_line);
-        return NULL;
-    }
-
     const char *method;
     size_t method_len;
     const char *path;
@@ -99,6 +89,12 @@ pico_parse_request(PyObject *self, PyObject *args, PyObject *kwargs)
         headers, &num_headers,
         (size_t)last_len
     );
+
+    if (pico_check_request_line(buf.buf, buf.len, ret, method, path, path_len,
+                                limit_request_line, LimitRequestLine) < 0) {
+        PyBuffer_Release(&buf);
+        return NULL;
+    }
 
     if (ret == -2) {
         PyBuffer_Release(&buf);
@@ -358,16 +354,6 @@ pico_parse_to_wsgi_environ(PyObject *self, PyObject *args, PyObject *kwargs)
         return NULL;
     }
 
-    /* Check request line length before parsing */
-    Py_ssize_t req_line_len = pico_find_request_line_length(buf.buf, buf.len);
-    if (req_line_len >= 0 && req_line_len > limit_request_line) {
-        PyBuffer_Release(&buf);
-        PyErr_Format(LimitRequestLine,
-            "Request line length (%zd) exceeds limit (%zd)",
-            req_line_len, limit_request_line);
-        return NULL;
-    }
-
     const char *method;
     size_t method_len;
     const char *path;
@@ -384,6 +370,12 @@ pico_parse_to_wsgi_environ(PyObject *self, PyObject *args, PyObject *kwargs)
         headers, &num_headers,
         0
     );
+
+    if (pico_check_request_line(buf.buf, buf.len, ret, method, path, path_len,
+                                limit_request_line, LimitRequestLine) < 0) {
+        PyBuffer_Release(&buf);
+        return NULL;
+    }
 
     if (ret == -2) {
         PyBuffer_Release(&buf);
@@ -665,16 +657,6 @@ pico_parse_to_asgi_scope(PyObject *self, PyObject *args, PyObject *kwargs)
         return NULL;
     }
 
-    /* Check request line length before parsing */
-    Py_ssize_t req_line_len = pico_find_request_line_length(buf.buf, buf.len);
-    if (req_line_len >= 0 && req_line_len > limit_request_line) {
-        PyBuffer_Release(&buf);
-        PyErr_Format(LimitRequestLine,
-            "Request line length (%zd) exceeds limit (%zd)",
-            req_line_len, limit_request_line);
-        return NULL;
-    }
-
     const char *method;
     size_t method_len;
     const char *path;
@@ -691,6 +673,12 @@ pico_parse_to_asgi_scope(PyObject *self, PyObject *args, PyObject *kwargs)
         headers, &num_headers,
         0
     );
+
+    if (pico_check_request_line(buf.buf, buf.len, ret, method, path, path_len,
+                                limit_request_line, LimitRequestLine) < 0) {
+        PyBuffer_Release(&buf);
+        return NULL;
+    }
 
     if (ret == -2) {
         PyBuffer_Release(&buf);

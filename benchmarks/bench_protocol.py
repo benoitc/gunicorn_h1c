@@ -39,6 +39,39 @@ CHUNKED_REQUEST = (
     b"0\r\n\r\n"
 )
 
+# A browser-like request, as gunicorn's ASGI worker sees it
+BROWSER_GET = (
+    b"GET /api/items?page=2 HTTP/1.1\r\n"
+    b"Host: example.com\r\n"
+    b"User-Agent: Mozilla/5.0 (X11; Linux x86_64) Gecko/20100101 Firefox/120.0\r\n"
+    b"Accept: text/html,application/xhtml+xml\r\n"
+    b"Accept-Language: en-US,en;q=0.5\r\n"
+    b"Accept-Encoding: gzip, deflate, br\r\n"
+    b"Connection: keep-alive\r\n"
+    b"Cookie: session=abcdef0123456789; theme=dark\r\n"
+    b"Cache-Control: max-age=0\r\n"
+    b"\r\n"
+)
+
+LARGE_BODY = (
+    b"POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 65536\r\n\r\n"
+    + b"x" * 65536
+)
+
+CHUNKED_HEAD = (
+    b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"
+)
+LARGE_CHUNKED = (
+    CHUNKED_HEAD
+    + b"".join(b"400\r\n" + b"y" * 1024 + b"\r\n" for _ in range(64))
+    + b"0\r\n\r\n"
+)
+MANY_SMALL_CHUNKS = (
+    CHUNKED_HEAD
+    + b"".join(b"10\r\n" + b"z" * 16 + b"\r\n" for _ in range(4096))
+    + b"0\r\n\r\n"
+)
+
 # Split headers for incremental test
 PARTIAL_HEADERS = [
     b"GET /search?q=hello HTTP/1.1\r\n",
@@ -173,6 +206,70 @@ def bench_callback_incremental(iterations: int) -> float:
     return end - start
 
 
+def bench_gunicorn_asgi_get(iterations: int) -> float:
+    """What gunicorn's ASGI worker does per request: feed, then read the
+    request state, both header lists and the tail."""
+    p = H1CProtocol(
+        on_headers_complete=lambda: False,
+        on_body=lambda chunk: None,
+        on_message_complete=lambda: None,
+    )
+    start = time.perf_counter()
+    for _ in range(iterations):
+        p.feed(BROWSER_GET)
+        _ = p.method, p.path, p.http_version
+        _ = list(p.asgi_headers)
+        for _name, _value in p.headers:
+            pass
+        _ = p.content_length, p.is_chunked, p.should_keep_alive
+        _ = p.remaining()
+        p.reset()
+    return time.perf_counter() - start
+
+
+def bench_pull_browser_get(iterations: int) -> float:
+    """gunicorn's WSGI fast path: parse_request on a browser-like request."""
+    from gunicorn_h1c import parse_request
+
+    start = time.perf_counter()
+    for _ in range(iterations):
+        parse_request(BROWSER_GET)
+    return time.perf_counter() - start
+
+
+def _feed_body(data, iterations, piece=None):
+    received = []
+    p = H1CProtocol(on_body=received.append)
+    pieces = (
+        [data]
+        if piece is None
+        else [data[i : i + piece] for i in range(0, len(data), piece)]
+    )
+    start = time.perf_counter()
+    for _ in range(iterations):
+        received.clear()
+        for chunk in pieces:
+            p.feed(chunk)
+        p.reset()
+    return time.perf_counter() - start
+
+
+def bench_large_body(iterations: int) -> float:
+    return _feed_body(LARGE_BODY, iterations)
+
+
+def bench_large_chunked(iterations: int) -> float:
+    return _feed_body(LARGE_CHUNKED, iterations)
+
+
+def bench_large_chunked_4k_reads(iterations: int) -> float:
+    return _feed_body(LARGE_CHUNKED, iterations, piece=4096)
+
+
+def bench_many_small_chunks(iterations: int) -> float:
+    return _feed_body(MANY_SMALL_CHUNKS, iterations)
+
+
 def format_rate(elapsed: float, iterations: int) -> str:
     """Format rate as requests/sec."""
     rate = iterations / elapsed
@@ -244,6 +341,18 @@ def main():
     print("-" * 75)
     run_benchmark("pull-based (buffer + retry)", bench_pull_incremental, iterations)
     run_benchmark("callback (multiple feeds)", bench_callback_incremental, iterations)
+    print()
+
+    print("gunicorn usage and bodies:")
+    print("-" * 75)
+    run_benchmark(
+        "ASGI worker per request (9 headers)", bench_gunicorn_asgi_get, iterations
+    )
+    run_benchmark("WSGI parse_request (9 headers)", bench_pull_browser_get, iterations)
+    run_benchmark("64 KiB Content-Length body, 1 read", bench_large_body, 20_000)
+    run_benchmark("64 KiB chunked (64 x 1 KiB), 1 read", bench_large_chunked, 20_000)
+    run_benchmark("64 KiB chunked, 4 KiB reads", bench_large_chunked_4k_reads, 20_000)
+    run_benchmark("4096 x 16 B chunks, 1 read", bench_many_small_chunks, 200)
     print()
 
     print("=" * 75)
