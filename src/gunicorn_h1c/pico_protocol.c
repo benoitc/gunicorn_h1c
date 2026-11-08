@@ -114,7 +114,8 @@ typedef struct {
 } H1CProtocol;
 
 /* Forward declarations */
-static int H1CProtocol_feed_headers(H1CProtocol *self);
+static int H1CProtocol_feed_headers(H1CProtocol *self, const char *in,
+                                    size_t in_len);
 static int H1CProtocol_feed_body_content_length(H1CProtocol *self, const char *data,
                                                 size_t len, int data_is_buffer);
 static int H1CProtocol_feed_body_chunked(H1CProtocol *self, const char *data,
@@ -418,16 +419,9 @@ H1CProtocol_feed_run(H1CProtocol *self, PyObject *args)
     }
 
     if (self->state == STATE_HEADERS) {
-        /* Buffer data for header parsing */
-        if (ensure_buffer_capacity(self, buf.len) < 0) {
-            PyBuffer_Release(&buf);
-            return NULL;
-        }
-        memcpy(self->buffer + self->buffer_len, buf.buf, buf.len);
-        self->buffer_len += buf.len;
+        int ret = H1CProtocol_feed_headers(self, buf.buf, (size_t)buf.len);
         PyBuffer_Release(&buf);
-
-        if (H1CProtocol_feed_headers(self) < 0) {
+        if (ret < 0) {
             return NULL;
         }
     }
@@ -650,7 +644,7 @@ H1CProtocol_scan_head(H1CProtocol *self)
 }
 
 static int
-H1CProtocol_feed_headers(H1CProtocol *self)
+H1CProtocol_feed_headers(H1CProtocol *self, const char *in, size_t in_len)
 {
     const char *method, *path;
     size_t method_len, path_len;
@@ -659,13 +653,23 @@ H1CProtocol_feed_headers(H1CProtocol *self)
     size_t num_headers = MAX_HEADERS;
     int ret = -2;
 
-    /* Fast path: the whole head usually arrives in the first feed(). Try a
-     * full parse before scanning; it already rejects bare LF and bare CR.
-     * On anything but success, fall back to the line scanner so limits are
-     * applied in order and an incomplete head stays bounded. */
-    if (self->hdr_scan == 0) {
+    /* Where the head is read from: the caller's bytes when the whole head
+     * arrives in one feed() with nothing buffered before it, which is the
+     * usual case, or the buffer otherwise. */
+    const char *base;
+    size_t len;
+    int in_buffer;
+
+    /* Fast path: try a full parse of the caller's bytes before anything is
+     * copied; it already rejects bare LF and bare CR. On anything but
+     * success, buffer the bytes and fall back to the line scanner so limits
+     * are applied in order and an incomplete head stays bounded. */
+    if (self->buffer_len == 0 && self->hdr_scan == 0) {
+        base = in;
+        len = in_len;
+        in_buffer = 0;
         ret = phr_parse_request(
-            self->buffer, self->buffer_len,
+            base, len,
             &method, &method_len,
             &path, &path_len,
             &minor_version,
@@ -675,7 +679,7 @@ H1CProtocol_feed_headers(H1CProtocol *self)
         if (ret > 0) {
             /* request line: from the method to its CRLF */
             const char *eol = memchr(path + path_len, '\r',
-                                     self->buffer + ret - (path + path_len));
+                                     base + ret - (path + path_len));
             Py_ssize_t line_len = eol ? (Py_ssize_t)(eol - method) : 0;
             if (line_len > self->limit_request_line) {
                 PyErr_Format(LimitRequestLine,
@@ -683,6 +687,19 @@ H1CProtocol_feed_headers(H1CProtocol *self)
                 return -1;
             }
         }
+    }
+
+    if (ret <= 0) {
+        /* Head incomplete or wrong: keep the bytes and let the scanner,
+         * which reads self->buffer, take it from here. */
+        if (ensure_buffer_capacity(self, in_len) < 0) {
+            return -1;
+        }
+        memcpy(self->buffer + self->buffer_len, in, in_len);
+        self->buffer_len += in_len;
+        base = self->buffer;
+        len = self->buffer_len;
+        in_buffer = 1;
     }
 
     int scanned = 0;
@@ -836,14 +853,12 @@ H1CProtocol_feed_headers(H1CProtocol *self)
     }
     self->skip_body = skip_body;
 
-    /* Keep unconsumed data */
+    /* What follows the head: the body, then whatever the client sent next.
+     * It is handed on from where it is; only a tail is copied. */
     size_t consumed = ret;
-    size_t remaining = self->buffer_len - consumed;
-
-    if (remaining > 0) {
-        memmove(self->buffer, self->buffer + consumed, remaining);
-    }
-    self->buffer_len = remaining;
+    size_t remaining = len - consumed;
+    const char *rest = base + consumed;
+    self->buffer_len = 0;
     self->hdr_scan = 0;
     self->hdr_line_start = 0;
     self->hdr_lines = 0;
@@ -863,7 +878,9 @@ H1CProtocol_feed_headers(H1CProtocol *self)
      * the no-body branch below and its tunnel bytes stay in remaining(). */
     if (skip_body) {
         self->state = STATE_COMPLETE;
-        H1CProtocol_clamp_tail(self);
+        if (H1CProtocol_keep_tail(self, rest, remaining, 0, in_buffer) < 0) {
+            return -1;
+        }
         if (self->on_message_complete) {
             PyObject *result = PyObject_CallNoArgs(self->on_message_complete);
             if (!result) return -1;
@@ -875,11 +892,8 @@ H1CProtocol_feed_headers(H1CProtocol *self)
         self->chunk_size = 0;
         self->chunk_remaining = 0;
         self->trailer_count = 0;
-        /* The body bytes that came with the head are at the start of the
-         * buffer; nothing is pending yet. */
-        self->buffer_len = 0;
         if (remaining > 0) {
-            return H1CProtocol_feed_body_chunked(self, self->buffer, remaining, 1);
+            return H1CProtocol_feed_body_chunked(self, rest, remaining, in_buffer);
         }
     }
     else if (self->content_length > 0) {
@@ -887,13 +901,15 @@ H1CProtocol_feed_headers(H1CProtocol *self)
         self->state = STATE_BODY;
         if (remaining > 0) {
             return H1CProtocol_feed_body_content_length(
-                self, self->buffer, remaining, 1);
+                self, rest, remaining, in_buffer);
         }
     }
     else {
         /* No body */
         self->state = STATE_COMPLETE;
-        H1CProtocol_clamp_tail(self);
+        if (H1CProtocol_keep_tail(self, rest, remaining, 0, in_buffer) < 0) {
+            return -1;
+        }
         if (self->on_message_complete) {
             PyObject *result = PyObject_CallNoArgs(self->on_message_complete);
             if (!result) return -1;
