@@ -121,3 +121,43 @@ def test_input_is_not_kept():
     assert p.headers == [(b"Host", b"a"), (b"Transfer-Encoding", b"chunked")]
     assert b"".join(received) == b"helloabc"
     assert p.remaining() == NEXT_REQUEST
+
+
+HEAD = b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n"
+
+
+def test_one_on_body_call_per_feed():
+    """Chunk data decoded in one feed() arrives in one call, as a
+    Content-Length body does."""
+    received = []
+    p = H1CProtocol(on_body=received.append)
+    p.feed(HEAD + b"5\r\nhello\r\n6\r\n world\r\n1\r\n!\r\n0\r\n\r\n")
+    assert received == [b"hello world!"]
+    assert p.is_complete
+
+
+def test_one_call_per_read():
+    received = []
+    p = H1CProtocol(on_body=received.append)
+    p.feed(HEAD + b"5\r\nhello\r\n3\r\nab")
+    p.feed(b"c\r\n2\r\nde\r\n0\r\n\r\n")
+    assert received == [b"helloab", b"cde"]
+
+
+def test_data_before_an_error_is_delivered():
+    from gunicorn_h1c._protocol import ParseError
+
+    received = []
+    p = H1CProtocol(on_body=received.append)
+    with pytest.raises(ParseError, match="chunk size"):
+        p.feed(HEAD + b"5\r\nhello\r\n3\r\nabc\r\nZZ\r\n")
+    assert received == [b"helloabc"]
+
+
+def test_on_body_error_wins():
+    def on_body(chunk):
+        raise RuntimeError("app")
+
+    p = H1CProtocol(on_body=on_body)
+    with pytest.raises(RuntimeError, match="app"):
+        p.feed(HEAD + b"5\r\nhello\r\nZZ\r\n")

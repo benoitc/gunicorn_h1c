@@ -111,6 +111,12 @@ typedef struct {
     /* Trailer lines seen in the chunked body */
     Py_ssize_t trailer_count;
 
+    /* Chunk data decoded during one feed(), handed to on_body in one call:
+     * where each piece sits in the bytes being decoded. */
+    struct pico_span { const char *data; size_t len; } *body_spans;
+    size_t body_nspans;
+    size_t body_spans_cap;
+
 } H1CProtocol;
 
 /* Forward declarations */
@@ -253,6 +259,7 @@ H1CProtocol_dealloc(H1CProtocol *self)
     PyObject_GC_UnTrack(self);
     H1CProtocol_clear(self);
 
+    PyMem_Free(self->body_spans);
     if (self->buffer) {
         PyMem_Free(self->buffer);
     }
@@ -370,6 +377,9 @@ H1CProtocol_init_impl(H1CProtocol *self, PyObject *args, PyObject *kwargs)
     self->chunk_remaining = 0;
     self->skip_body = 0;
     self->trailer_count = 0;
+    self->body_spans = NULL;
+    self->body_nspans = 0;
+    self->body_spans_cap = 0;
 
     return 0;
 }
@@ -1149,20 +1159,100 @@ H1CProtocol_trailer_line(H1CProtocol *self, const char *line, size_t line_len)
     return 0;
 }
 
-/* Hand decoded chunk data to on_body */
+/* Note decoded chunk data; H1CProtocol_flush_body() hands it to on_body */
 static int
 H1CProtocol_chunk_data(H1CProtocol *self, const char *data, size_t len)
 {
     if (self->skip_body || !self->on_body || len == 0) {
         return 0;
     }
-    PyObject *chunk = PyBytes_FromStringAndSize(data, (Py_ssize_t)len);
+    if (self->body_nspans == self->body_spans_cap) {
+        size_t cap = self->body_spans_cap ? self->body_spans_cap * 2 : 16;
+        struct pico_span *spans = PyMem_Realloc(self->body_spans,
+                                                cap * sizeof(*spans));
+        if (!spans) {
+            PyErr_NoMemory();
+            return -1;
+        }
+        self->body_spans = spans;
+        self->body_spans_cap = cap;
+    }
+    self->body_spans[self->body_nspans].data = data;
+    self->body_spans[self->body_nspans].len = len;
+    self->body_nspans++;
+    return 0;
+}
+
+/*
+ * Hand the chunk data decoded so far in this feed() to on_body, in one call
+ * and as one bytes object, as a Content-Length body arrives. The pieces
+ * point into the bytes being decoded, so this runs before anything is
+ * written over them and before feed() returns.
+ */
+static int
+H1CProtocol_flush_body(H1CProtocol *self)
+{
+    size_t n = self->body_nspans;
+    if (n == 0) {
+        return 0;
+    }
+    self->body_nspans = 0;
+
+    PyObject *chunk;
+    if (n == 1) {
+        chunk = PyBytes_FromStringAndSize(self->body_spans[0].data,
+                                          (Py_ssize_t)self->body_spans[0].len);
+    } else {
+        size_t total = 0;
+        for (size_t i = 0; i < n; i++) {
+            total += self->body_spans[i].len;
+        }
+        chunk = PyBytes_FromStringAndSize(NULL, (Py_ssize_t)total);
+        if (chunk) {
+            char *out = PyBytes_AS_STRING(chunk);
+            for (size_t i = 0; i < n; i++) {
+                memcpy(out, self->body_spans[i].data, self->body_spans[i].len);
+                out += self->body_spans[i].len;
+            }
+        }
+    }
     if (!chunk) return -1;
     PyObject *result = PyObject_CallOneArg(self->on_body, chunk);
     Py_DECREF(chunk);
     if (!result) return -1;
     Py_DECREF(result);
     return 0;
+}
+
+/*
+ * On a parse error, still deliver the data decoded before it, as on_body
+ * did when it was called per chunk. An error from on_body wins.
+ */
+static int
+H1CProtocol_fail_after_body(H1CProtocol *self)
+{
+    if (self->body_nspans == 0) {
+        return -1;
+    }
+#if PY_VERSION_HEX >= 0x030C0000
+    PyObject *exc = PyErr_GetRaisedException();
+    if (H1CProtocol_flush_body(self) < 0) {
+        Py_XDECREF(exc);
+        return -1;
+    }
+    PyErr_SetRaisedException(exc);
+#else
+    PyObject *type, *value, *tb;
+    PyErr_Fetch(&type, &value, &tb);
+    if (H1CProtocol_flush_body(self) < 0) {
+        Py_XDECREF(type);
+        Py_XDECREF(value);
+        Py_XDECREF(tb);
+        return -1;
+    }
+    PyErr_Restore(type, value, tb);
+#endif
+    return -1;
 }
 
 #define PICO_CHUNKED_NEED_MORE 0
@@ -1321,7 +1411,13 @@ H1CProtocol_feed_body_chunked(H1CProtocol *self, const char *data, size_t len,
 
     if (rc != PICO_CHUNKED_DONE) {
         rc = H1CProtocol_decode_chunked(self, data, len, &pos);
-        if (rc < 0) return -1;
+        if (rc < 0) return H1CProtocol_fail_after_body(self);
+    }
+
+    /* The decoded data points into `data`, which the code below may write
+     * over when it is the buffer: deliver it first. */
+    if (H1CProtocol_flush_body(self) < 0) {
+        return -1;
     }
 
     if (rc == PICO_CHUNKED_NEED_MORE) {
@@ -1458,6 +1554,7 @@ H1CProtocol_reset_impl(H1CProtocol *self, PyObject *Py_UNUSED(ignored))
     self->hdr_lines = 0;
     self->hdr_in_fields = 0;
     self->trailer_count = 0;
+    self->body_nspans = 0;
 
     Py_XDECREF(self->py_method);
     self->py_method = NULL;
