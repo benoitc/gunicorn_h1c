@@ -869,6 +869,83 @@ pico_find_request_line_length(const char *buf, size_t buf_len)
 }
 
 /*
+ * Size of a header line as gunicorn's Python parsers count it: the line as
+ * received, whitespace around the value included, plus CRLF. Only valid on a
+ * header parsed by picohttpparser, whose line is followed by CRLF.
+ */
+static inline size_t
+pico_header_line_size(const struct phr_header *h)
+{
+    if (h->name == NULL) {
+        return h->value_len + 4;  /* folded line, rejected right after */
+    }
+    const char *end = h->value + h->value_len;
+    while (*end == ' ' || *end == '\t') {
+        end++;
+    }
+    return (size_t)(end - h->name) + 2;
+}
+
+/*
+ * Quick checks of one complete line, without its CRLF, for H1CProtocol,
+ * which validates each line of the head as it arrives. They accept exactly
+ * what picohttpparser accepts; on a line they refuse,
+ * pico_analyze_parse_error() gives the class and message.
+ */
+static inline int
+pico_request_line_ok(const char *line, size_t len,
+                     const char **method, size_t *method_len,
+                     const char **target, size_t *target_len,
+                     int *minor_version)
+{
+    const unsigned char *p = (const unsigned char *)line;
+    const unsigned char *end = p + len;
+
+    *method = (const char *)p;
+    while (p < end && *p != ' ') {
+        if (!pico_is_token_char(*p)) return 0;
+        p++;
+    }
+    *method_len = (size_t)((const char *)p - *method);
+    if (*method_len == 0 || p >= end) return 0;
+    while (p < end && *p == ' ') p++;
+
+    *target = (const char *)p;
+    while (p < end && *p != ' ') {
+        if (*p < 0x20 || *p == 0x7f) return 0;
+        p++;
+    }
+    *target_len = (size_t)((const char *)p - *target);
+    if (*target_len == 0 || p >= end) return 0;
+    while (p < end && *p == ' ') p++;
+
+    if (end - p != 8 || memcmp(p, "HTTP/1.", 7) != 0 ||
+        p[7] < '0' || p[7] > '9') {
+        return 0;
+    }
+    *minor_version = p[7] - '0';
+    return 1;
+}
+
+static inline int
+pico_header_line_ok(const char *line, size_t len)
+{
+    const unsigned char *p = (const unsigned char *)line;
+    const unsigned char *end = p + len;
+
+    const unsigned char *name = p;
+    while (p < end && *p != ':') {
+        if (!pico_is_token_char(*p)) return 0;
+        p++;
+    }
+    if (p == name || p >= end) return 0;
+    for (p++; p < end; p++) {
+        if (*p < 0x20 ? *p != '\t' : *p == 0x7f) return 0;
+    }
+    return 1;
+}
+
+/*
  * Analyze buffer when phr_parse_request returns -1 and set specific exception.
  * Returns -1 (always sets an exception).
  *
@@ -1066,21 +1143,22 @@ pico_validate_headers_full(struct phr_header *headers, size_t num_headers,
                            PyObject *InvalidHeaderName,
                            PyObject *InvalidHeader)
 {
-    /* Check header count */
-    if ((Py_ssize_t)num_headers > config->limit_request_fields) {
-        PyErr_Format(LimitRequestHeaders,
-            "Number of headers (%zu) exceeds limit (%zd)",
-            num_headers, config->limit_request_fields);
-        return -1;
-    }
-
     for (size_t i = 0; i < num_headers; i++) {
-        /* Check header line size (name + ": " + value + CRLF) */
-        size_t header_size = headers[i].name_len + 2 + headers[i].value_len + 2;
+        /* Line by line, in the order gunicorn's ASGI parser checks them:
+         * size, count, then content. The size is the line as received,
+         * whitespace included, plus CRLF, as gunicorn counts it. */
+        size_t header_size = pico_header_line_size(&headers[i]);
         if ((Py_ssize_t)header_size > config->limit_request_field_size) {
             PyErr_Format(LimitRequestHeaders,
                 "Header size (%zu) exceeds limit (%zd)",
                 header_size, config->limit_request_field_size);
+            return -1;
+        }
+
+        if ((Py_ssize_t)(i + 1) > config->limit_request_fields) {
+            PyErr_Format(LimitRequestHeaders,
+                "Number of headers (%zu) exceeds limit (%zd)",
+                num_headers, config->limit_request_fields);
             return -1;
         }
 
@@ -1127,24 +1205,22 @@ pico_validate_headers(struct phr_header *headers, size_t num_headers,
                       PyObject *InvalidHeaderName,
                       PyObject *InvalidHeader)
 {
-    /* Check header count */
-    if ((Py_ssize_t)num_headers > config->limit_request_fields) {
-        /* Same message as when H1CProtocol stops at the line over the
-         * limit before the head is complete, so it does not depend on how
-         * the request was split. */
-        PyErr_Format(LimitRequestHeaders,
-            "Number of headers exceeds limit (%zd)",
-            config->limit_request_fields);
-        return -1;
-    }
-
     for (size_t i = 0; i < num_headers; i++) {
-        /* Check header line size (name + ": " + value + CRLF) */
-        size_t header_size = headers[i].name_len + 2 + headers[i].value_len + 2;
-        if ((Py_ssize_t)header_size > config->limit_request_field_size) {
+        /* Same checks, order and messages as H1CProtocol applies to each
+         * line while the head is still arriving, so the result does not
+         * depend on how the request was split. */
+        if ((Py_ssize_t)pico_header_line_size(&headers[i]) >
+                config->limit_request_field_size) {
             PyErr_Format(LimitRequestHeaders,
                 "Header size exceeds limit (%zd)",
                 config->limit_request_field_size);
+            return -1;
+        }
+
+        if ((Py_ssize_t)(i + 1) > config->limit_request_fields) {
+            PyErr_Format(LimitRequestHeaders,
+                "Number of headers exceeds limit (%zd)",
+                config->limit_request_fields);
             return -1;
         }
 

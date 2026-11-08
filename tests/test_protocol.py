@@ -9,6 +9,8 @@ from gunicorn_h1c._protocol import ParseError as ProtocolParseError
 from gunicorn_h1c import (
     H1CProtocol,
     InvalidChunkExtension,
+    InvalidHeader,
+    InvalidHeaderName,
     LimitRequestHeaders,
     LimitRequestLine,
     ParseError,  # From _parser module
@@ -1377,3 +1379,108 @@ class TestH1CProtocolGarbageCollection:
             pass
 
         assert self.owner_collected(parser_class=Sub)
+
+
+def request_with(*lines):
+    return b"GET / HTTP/1.1\r\n" + b"".join(line + b"\r\n" for line in lines) + b"\r\n"
+
+
+def feed_all(p, data, bytewise):
+    step = 1 if bytewise else len(data)
+    for i in range(0, len(data), step):
+        p.feed(data[i : i + step])
+
+
+class TestHeaderLineSize:
+    """A header line counts as received, whitespace around the value
+    included, plus CRLF, as gunicorn's Python parsers count it."""
+
+    LIMIT = 100
+
+    def parsers(self):
+        import gunicorn_h1c
+
+        limit = dict(limit_request_field_size=self.LIMIT)
+        yield "parse_request", lambda d: gunicorn_h1c.parse_request(d, **limit)
+        yield (
+            "parse_request_fast",
+            lambda d: gunicorn_h1c.parse_request_fast(d, **limit),
+        )
+        yield (
+            "parse_to_wsgi_environ",
+            lambda d: gunicorn_h1c.parse_to_wsgi_environ(d, **limit),
+        )
+        for bytewise in (False, True):
+            yield (
+                f"H1CProtocol bytewise={bytewise}",
+                lambda d, b=bytewise: feed_all(H1CProtocol(**limit), d, b),
+            )
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            b"X-A:" + b" " * 80 + b"value" + b" " * 10,  # 99 + CRLF
+            b"X-A:" + b"\t" * 1990 + b"value",
+            b"X-A: value" + b" " * 200,
+        ],
+        ids=["spaces", "tabs", "trailing"],
+    )
+    def test_padding_counts(self, line):
+        for name, parse in self.parsers():
+            with pytest.raises(LimitRequestHeaders):
+                parse(request_with(b"Host: a", line))
+                pytest.fail(name)
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            b"X-A:" + b" " * 83 + b"value" + b" " * 6,  # 98 + CRLF = 100
+            b"X-A:" + b"v" * 94,  # no space after the colon, 98 + CRLF
+        ],
+        ids=["padded", "no-space"],
+    )
+    def test_line_at_the_limit_is_accepted(self, line):
+        for _, parse in self.parsers():
+            parse(request_with(b"Host: a", line))
+
+
+class TestHeadErrorOrder:
+    """With more than one problem in the head, the first bad line decides,
+    whether the request arrives whole or in pieces."""
+
+    CASES = [
+        (b"X-\x01: 1", b"X-B: " + b"b" * 200, InvalidHeaderName),
+        (b"X-B: " + b"b" * 200, b"X-\x01: 1", LimitRequestHeaders),
+        (b"X-A: \x80\x00", b"X-B: " + b"b" * 200, InvalidHeader),
+        (b"X-B: " + b"b" * 200 + b"\nY", b"X-A: 1", LimitRequestHeaders),
+        (b"X-B: " + b"b" * 200 + b"\rY", b"X-A: 1", LimitRequestHeaders),
+        (b"X-A: 1", b" folded", InvalidHeader),
+    ]
+
+    @pytest.mark.parametrize("first,second,expected", CASES)
+    @pytest.mark.parametrize("bytewise", [False, True], ids=["whole", "bytewise"])
+    def test_first_bad_line_wins(self, first, second, expected, bytewise):
+        p = H1CProtocol(limit_request_field_size=100, limit_request_fields=5)
+        with pytest.raises(expected):
+            feed_all(p, request_with(b"Host: a", first, second), bytewise)
+
+    @pytest.mark.parametrize("bytewise", [False, True], ids=["whole", "bytewise"])
+    def test_count_before_a_later_bad_line(self, bytewise):
+        p = H1CProtocol(limit_request_fields=5)
+        with pytest.raises(LimitRequestHeaders):
+            feed_all(p, request_with(*[b"X-H: 1"] * 6, b"X-\x01: 1"), bytewise)
+
+    @pytest.mark.parametrize("bytewise", [False, True], ids=["whole", "bytewise"])
+    def test_bad_line_before_the_count(self, bytewise):
+        p = H1CProtocol(limit_request_fields=5)
+        with pytest.raises(InvalidHeaderName):
+            feed_all(p, request_with(b"X-\x01: 1", *[b"X-H: 1"] * 6), bytewise)
+
+    @pytest.mark.parametrize("bytewise", [False, True], ids=["whole", "bytewise"])
+    def test_request_line_before_headers(self, bytewise):
+        from gunicorn_h1c import InvalidHTTPVersion
+
+        p = H1CProtocol(limit_request_field_size=100)
+        data = b"GET / HTTP/1.2\r\nX-B: " + b"b" * 200 + b"\r\n\r\n"
+        with pytest.raises(InvalidHTTPVersion):
+            feed_all(p, data, bytewise)

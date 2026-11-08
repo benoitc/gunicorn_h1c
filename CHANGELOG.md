@@ -17,6 +17,18 @@ All notable changes to this project will be documented in this file.
   and where it sits in the request.
 - `H1CProtocol` gives the same message for a request line, a header line or a
   header count over its limit whether the request arrived whole or in pieces.
+- Count a header line the way gunicorn does: the line as received, spaces
+  and tabs around the value included, plus CRLF. gunicorn_h1c used to leave
+  that whitespace out, so a line padded past `limit_request_field_size` was
+  accepted where gunicorn's own parsers answer 431, including on gunicorn's
+  WSGI workers with `--http-parser fast`. Such a line is now rejected on
+  every entry point, and a line with no space after the colon gets the byte
+  it was charged for that space.
+- `H1CProtocol` checks each line of the request head as it arrives, in the
+  order gunicorn's parser does (size, count, then content), so when a
+  request has more than one problem the first bad line decides, whole or in
+  pieces. A head that never ends is rejected at its first bad line instead
+  of waiting for more data.
 
 ### Changed
 
@@ -28,7 +40,10 @@ All notable changes to this project will be documented in this file.
   before, now that the first invalid byte decides. A bare LF at the start of
   a header line or in the method, or a second empty line before the request
   line, is a `ParseError`; a bare LF or CR inside a header value is an
-  `InvalidHeader`. Nothing that was accepted is rejected, or the reverse.
+  `InvalidHeader`.
+- A header line whose spaces or tabs take it past `limit_request_field_size`
+  is now rejected with `LimitRequestHeaders`. Apart from that, nothing that
+  was accepted is rejected, or the reverse.
 - Code that caught `gunicorn_h1c._protocol.ParseError` or
   `gunicorn_h1c._parser_fast.ParseError` for these requests now gets the
   specific class. Every specific class derives from `gunicorn_h1c.ParseError`

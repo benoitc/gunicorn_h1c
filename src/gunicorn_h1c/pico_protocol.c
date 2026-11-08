@@ -552,37 +552,43 @@ H1CProtocol_scan_head(H1CProtocol *self)
         ? (size_t)self->limit_request_field_size : PICO_FALLBACK_MAX_FIELD_LINE;
 
     while (1) {
+        /* Next LF; find_crlf tells a CRLF (>= 0) from a bare LF (-2) */
         Py_ssize_t idx = find_crlf(self->buffer, self->buffer_len,
                                    self->hdr_scan);
-        if (idx == -2) {
-            /* RFC 9112 section 2.2: CRLF only */
-            return H1CProtocol_head_error(self);
-        }
+        size_t limit = self->hdr_in_fields ? field_limit : line_limit;
 
-        if (idx == -1) {
-            size_t pending = self->buffer_len - self->hdr_line_start;
-            if (!self->hdr_in_fields && pending > line_limit + 1) {
-                PyErr_Format(LimitRequestLine,
-                    "Request line exceeds limit (%zu)", line_limit);
+        if (idx < 0) {
+            /* No CRLF yet, or a bare LF. Either way the line so far is
+             * held to its limit first, so that a line that gets too long
+             * is reported the same way whether or not its bad byte has
+             * arrived yet. */
+            const char *lf = idx == -2
+                ? memchr(self->buffer + self->hdr_scan, '\n',
+                         self->buffer_len - self->hdr_scan)
+                : NULL;
+            size_t upto = lf ? (size_t)(lf - self->buffer) : self->buffer_len;
+            if (upto - self->hdr_line_start > limit + 1) {
+                if (!self->hdr_in_fields) {
+                    PyErr_Format(LimitRequestLine,
+                        "Request line exceeds limit (%zu)", line_limit);
+                } else {
+                    PyErr_Format(LimitRequestHeaders,
+                        "Header size exceeds limit (%zu)", field_limit);
+                }
                 return -1;
             }
-            if (self->hdr_in_fields && pending > field_limit + 1) {
-                PyErr_Format(LimitRequestHeaders,
-                    "Header size exceeds limit (%zu)", field_limit);
-                return -1;
+            if (idx == -2) {
+                /* RFC 9112 section 2.2: CRLF only */
+                return H1CProtocol_head_error(self);
             }
             self->hdr_scan = self->buffer_len;
             return 0;
         }
 
+        const char *line = self->buffer + self->hdr_line_start;
         size_t line_len = (size_t)idx - self->hdr_line_start;
         size_t next = (size_t)idx + 2;
         self->hdr_scan = next;
-
-        /* RFC 9112 section 2.2: a bare CR makes the element invalid */
-        if (memchr(self->buffer + self->hdr_line_start, '\r', line_len)) {
-            return H1CProtocol_head_error(self);
-        }
 
         if (!self->hdr_in_fields) {
             /* One empty line before the request line is ignored
@@ -591,21 +597,60 @@ H1CProtocol_scan_head(H1CProtocol *self)
                 self->hdr_line_start = next;
                 continue;
             }
+            /* Same checks, in the same order, as for a head that arrives
+             * whole: length, syntax, then method, target and version. */
             if ((Py_ssize_t)line_len > self->limit_request_line) {
                 PyErr_Format(LimitRequestLine,
                     "Request line exceeds limit (%zd)", self->limit_request_line);
+                return -1;
+            }
+            const char *method, *target;
+            size_t method_len, target_len;
+            int minor_version;
+            if (!pico_request_line_ok(line, line_len, &method, &method_len,
+                                      &target, &target_len, &minor_version)) {
+                return H1CProtocol_head_error(self);
+            }
+            if (pico_validate_method(method, method_len,
+                                      self->permit_unconventional_http_method,
+                                      InvalidRequestMethod) < 0 ||
+                pico_validate_request_target(method, method_len, target,
+                                              target_len, ParseError) < 0 ||
+                pico_validate_version(minor_version,
+                                       self->permit_unconventional_http_version,
+                                       InvalidHTTPVersion) < 0) {
                 return -1;
             }
             self->hdr_in_fields = 1;
         } else if (line_len == 0) {
             return 1;  /* end of the head */
         } else {
+            /* Header line: size (as received, plus CRLF), count, folding,
+             * then content, as pico_validate_headers() does for a head
+             * that arrives whole. */
+            if ((Py_ssize_t)(line_len + 2) > self->limit_request_field_size) {
+                PyErr_Format(LimitRequestHeaders,
+                    "Header size exceeds limit (%zd)",
+                    self->limit_request_field_size);
+                return -1;
+            }
             self->hdr_lines++;
             if (self->hdr_lines > self->limit_request_fields) {
                 PyErr_Format(LimitRequestHeaders,
                     "Number of headers exceeds limit (%zd)",
                     self->limit_request_fields);
                 return -1;
+            }
+            if (line[0] == ' ' || line[0] == '\t') {
+                if (self->hdr_lines == 1) {
+                    return H1CProtocol_head_error(self);
+                }
+                PyErr_SetString(InvalidHeader,
+                    "Obsolete line folding is not allowed (RFC 9112 section 5.2)");
+                return -1;
+            }
+            if (!pico_header_line_ok(line, line_len)) {
+                return H1CProtocol_head_error(self);
             }
         }
         self->hdr_line_start = next;
@@ -648,11 +693,15 @@ H1CProtocol_feed_headers(H1CProtocol *self)
         }
     }
 
+    int scanned = 0;
     if (ret <= 0) {
         int head = H1CProtocol_scan_head(self);
         if (head <= 0) {
             return head;
         }
+        /* The scanner already checked every line, with the same rules and
+         * in the same order as below. */
+        scanned = 1;
 
         num_headers = MAX_HEADERS;
         ret = phr_parse_request(
@@ -669,40 +718,42 @@ H1CProtocol_feed_headers(H1CProtocol *self)
         }
     }
 
-    /* Validate method */
-    if (pico_validate_method(method, method_len,
-                              self->permit_unconventional_http_method,
-                              InvalidRequestMethod) < 0) {
-        return -1;
-    }
+    if (!scanned) {
+        /* Validate method */
+        if (pico_validate_method(method, method_len,
+                                  self->permit_unconventional_http_method,
+                                  InvalidRequestMethod) < 0) {
+            return -1;
+        }
 
-    /* Validate request-target form against method (RFC 9112) */
-    if (pico_validate_request_target(method, method_len, path, path_len,
-                                      ParseError) < 0) {
-        return -1;
-    }
+        /* Validate request-target form against method (RFC 9112) */
+        if (pico_validate_request_target(method, method_len, path, path_len,
+                                          ParseError) < 0) {
+            return -1;
+        }
 
-    /* Validate HTTP version */
-    if (pico_validate_version(minor_version,
-                               self->permit_unconventional_http_version,
-                               InvalidHTTPVersion) < 0) {
-        return -1;
-    }
+        /* Validate HTTP version */
+        if (pico_validate_version(minor_version,
+                                   self->permit_unconventional_http_version,
+                                   InvalidHTTPVersion) < 0) {
+            return -1;
+        }
 
-    /* Validate headers */
-    PicoValidationConfig config = {
-        .limit_request_line = self->limit_request_line,
-        .limit_request_fields = self->limit_request_fields,
-        .limit_request_field_size = self->limit_request_field_size,
-        .permit_unconventional_http_method = self->permit_unconventional_http_method,
-        .permit_unconventional_http_version = self->permit_unconventional_http_version
-    };
+        /* Validate headers */
+        PicoValidationConfig config = {
+            .limit_request_line = self->limit_request_line,
+            .limit_request_fields = self->limit_request_fields,
+            .limit_request_field_size = self->limit_request_field_size,
+            .permit_unconventional_http_method = self->permit_unconventional_http_method,
+            .permit_unconventional_http_version = self->permit_unconventional_http_version
+        };
 
-    if (pico_validate_headers(headers, num_headers, &config,
-                               LimitRequestHeaders,
-                               InvalidHeaderName,
-                               InvalidHeader) < 0) {
-        return -1;
+        if (pico_validate_headers(headers, num_headers, &config,
+                                   LimitRequestHeaders,
+                                   InvalidHeaderName,
+                                   InvalidHeader) < 0) {
+            return -1;
+        }
     }
 
     /* Validate framing before anything is published or any callback runs,
