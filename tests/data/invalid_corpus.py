@@ -291,6 +291,21 @@ CASES = [
     ("parse_request_fast", b"GET / HTTP/1.1\r\nX-Test: val\x00ue\r\n\r\n", {}),
     ("parse_request_fast", b"GET / HTTP/1.1\r\nX-Test: value\nmore\r\n\r\n", {}),
     ("parse_request_fast", b"GET / FTP/1.1\r\n\r\n", {}),
+    (
+        "parse_request",
+        b"\r\nGET /aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa HTTP/1.1\r\nHost: a\r\n\r\n",
+        {"limit_request_line": 100},
+    ),
+    (
+        "parse_request_fast",
+        b"\r\nGET /aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa HTTP/1.1\r\nHost: a\r\n\r\n",
+        {"limit_request_line": 100},
+    ),
+    (
+        "H1CProtocol",
+        b"\r\nGET /aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa HTTP/1.1\r\nHost: a\r\n\r\n",
+        {"limit_request_line": 100},
+    ),
     ("H1CProtocol", b"INVALID\r\n\r\n", {}),
     (
         "H1CProtocol",
@@ -463,11 +478,6 @@ CASES = [
         {"limit_request_field_size": 100},
     ),
     (
-        "parse_request",
-        b"GET / HTTP/1.1\r\nHost: a\r\nX-A:                                                                                     value      \r\n\r\n",
-        {"limit_request_field_size": 100},
-    ),
-    (
         "H1CProtocol",
         b"GET / HTTP/1.1\r\nHost: a\r\nX-\x01: 1\r\nX-B: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\r\n\r\n",
         {"limit_request_field_size": 100, "limit_request_fields": 5},
@@ -534,6 +544,66 @@ CASES = [
         {"limit_request_field_size": 100},
     ),
     ("H1CProtocol", b"GET / HTTP/1.2\r\n", {"limit_request_field_size": 100}),
+    (
+        "H1CProtocol",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n1;a\x01\r\nx\r\n0\r\n\r\n",
+        {},
+    ),
+    (
+        "H1CProtocol",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n1;a=\x00\r\nx\r\n0\r\n\r\n",
+        {},
+    ),
+    (
+        "H1CProtocol",
+        b'POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n1;a="x\x1fy"\r\nx\r\n0\r\n\r\n',
+        {},
+    ),
+    (
+        "H1CProtocol",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n1;a\x7f\r\nx\r\n0\r\n\r\n",
+        {},
+    ),
+    (
+        "H1CProtocol",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n1;a\x0b\r\nx\r\n0\r\n\r\n",
+        {},
+    ),
+    (
+        "H1CProtocol",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n1;\x1b\r\nx\r\n0\r\n\r\n",
+        {},
+    ),
+    (
+        "H1CProtocol",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n1;a\x01\r\n",
+        {},
+    ),
+    (
+        "H1CProtocol",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n1;a=\x00\r\n",
+        {},
+    ),
+    (
+        "H1CProtocol",
+        b'POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n1;a="x\x1fy"\r\n',
+        {},
+    ),
+    (
+        "H1CProtocol",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n1;a\x7f\r\n",
+        {},
+    ),
+    (
+        "H1CProtocol",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n1;a\x0b\r\n",
+        {},
+    ),
+    (
+        "H1CProtocol",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n1;\x1b\r\n",
+        {},
+    ),
     (
         "parse_request",
         b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Value: bad\x07char\r\n\r\n",
