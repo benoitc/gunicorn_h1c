@@ -168,9 +168,10 @@ def te_request(value, extra=b""):
 
 class TestTransferEncoding:
     """Transfer-Encoding is handled exactly as gunicorn's Python parsers do
-    (RFC 9112 section 6.1): an empty coding is unsupported, and a compression
-    coding without chunked closes the connection so that its unread body is
-    never parsed as another request."""
+    (RFC 9112 sections 6.1 and 6.3): an empty coding is unsupported, a
+    request whose codings do not end with chunked is rejected, so its body is
+    never parsed as another request, and a compression coding before chunked
+    closes the connection after the message."""
 
     EMPTY = [b"", b" ", b"gzip, ", b",chunked", b"chunked,,", b"gzip,,chunked"]
 
@@ -189,11 +190,10 @@ class TestTransferEncoding:
             func(te_request(value))
 
     @pytest.mark.parametrize("coding", [b"gzip", b"deflate", b"compress", b"GZIP"])
-    def test_compression_without_chunked_closes(self, coding):
+    def test_compression_without_chunked_is_rejected(self, coding):
         p = H1CProtocol()
-        p.feed(te_request(coding) + b"GET /hidden HTTP/1.1\r\nHost: a\r\n\r\n")
-        assert p.is_complete
-        assert not p.should_keep_alive
+        with pytest.raises(InvalidHeader, match="does not end with chunked"):
+            p.feed(te_request(coding) + b"GET /hidden HTTP/1.1\r\nHost: a\r\n\r\n")
 
     @pytest.mark.parametrize("where", ["before", "after"])
     def test_keep_alive_does_not_override_compression(self, where):
@@ -202,12 +202,13 @@ class TestTransferEncoding:
             data = (
                 b"POST / HTTP/1.1\r\nHost: a\r\n"
                 + keep
-                + b"Transfer-Encoding: gzip\r\n\r\n"
+                + b"Transfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n"
             )
         else:
-            data = te_request(b"gzip", keep)
+            data = te_request(b"gzip, chunked", keep) + b"0\r\n\r\n"
         p = H1CProtocol()
         p.feed(data)
+        assert p.is_complete
         assert not p.should_keep_alive
 
     def test_compression_then_chunked_parses_and_closes(self):
@@ -224,13 +225,12 @@ class TestTransferEncoding:
         assert p.is_complete
         assert p.should_keep_alive
 
-    def test_identity_with_content_length_uses_the_length(self):
-        """Same as gunicorn: identity is accepted and Content-Length frames."""
-        body = []
-        p = H1CProtocol(on_body=body.append)
-        p.feed(te_request(b"identity", b"Content-Length: 3\r\n") + b"abc")
-        assert p.is_complete
-        assert body == [b"abc"]
+    def test_identity_with_content_length_is_rejected(self):
+        """Same as gunicorn: Transfer-Encoding that does not end with chunked
+        is rejected, whatever Content-Length says (RFC 9112 section 6.3)."""
+        p = H1CProtocol()
+        with pytest.raises(InvalidHeader, match="does not end with chunked"):
+            p.feed(te_request(b"identity", b"Content-Length: 3\r\n") + b"abc")
 
 
 class TestWsgiEnvironNames:

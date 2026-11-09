@@ -76,13 +76,18 @@ typedef struct {
     int connection_close;       /* -1=unset, 0=keep-alive, 1=close */
     int should_upgrade;         /* 1 if Upgrade header present */
     int has_content_length;     /* 1 if Content-Length header present */
-    int chunked_count;          /* Number of "chunked" values seen */
-    int has_te_after_chunked;   /* 1 if T-E value after chunked */
-    int has_unknown_te;         /* 1 if unknown Transfer-Encoding value */
+    int has_te;                 /* 1 if a Transfer-Encoding field is present */
+    int te_error;               /* first PICO_TE_* error, in list order */
     int te_forces_close;        /* 1 if a compression coding was seen */
     unsigned int singleton_seen; /* Bitmask of pico_singleton_fields seen */
     int duplicate_singleton;    /* Index of first repeated singleton, -1 if none */
 } PicoHeaderInfo;
+
+/* Transfer-Encoding errors, recorded in the order the codings appear */
+#define PICO_TE_OK 0
+#define PICO_TE_UNKNOWN 1        /* not a coding we understand: 501 */
+#define PICO_TE_STACKED 2        /* chunked twice */
+#define PICO_TE_AFTER_CHUNKED 3  /* a coding after chunked */
 
 /*
  * Case-insensitive header name comparison.
@@ -279,6 +284,10 @@ pico_parse_transfer_encoding(const char *value, size_t value_len, PicoHeaderInfo
     const char *p = value;
     const char *end = value + value_len;
 
+    info->has_te = 1;
+#define PICO_TE_FAIL(kind) \
+    do { if (info->te_error == PICO_TE_OK) info->te_error = (kind); } while (0)
+
     while (1) {
         const char *token_start = p;
         const char *token_end = p;
@@ -293,14 +302,14 @@ pico_parse_transfer_encoding(const char *value, size_t value_len, PicoHeaderInfo
         if (te_type == 1) {
             /* chunked */
             if (info->has_chunked) {
-                info->chunked_count++;  /* Stacked chunked */
+                PICO_TE_FAIL(PICO_TE_STACKED);
             }
             info->has_chunked = 1;
         }
         else if (te_type == 2 || te_type == 3) {
             /* identity, gzip, deflate, compress */
             if (info->has_chunked) {
-                info->has_te_after_chunked = 1;  /* T-E value after chunked */
+                PICO_TE_FAIL(PICO_TE_AFTER_CHUNKED);
             }
             if (te_type == 3) {
                 /* Not decoded here, so the length of the body is unknown:
@@ -310,8 +319,8 @@ pico_parse_transfer_encoding(const char *value, size_t value_len, PicoHeaderInfo
             }
         }
         else {
-            /* Unknown or empty transfer coding */
-            info->has_unknown_te = 1;
+            /* Unknown or empty transfer coding, or one with parameters */
+            PICO_TE_FAIL(PICO_TE_UNKNOWN);
         }
 
         if (token_end >= end) {
@@ -319,6 +328,7 @@ pico_parse_transfer_encoding(const char *value, size_t value_len, PicoHeaderInfo
         }
         p = token_end + 1;  /* past the comma */
     }
+#undef PICO_TE_FAIL
 }
 
 /*
@@ -336,9 +346,8 @@ pico_extract_headers(struct phr_header *headers, size_t num_headers,
     info->connection_close = -1;
     info->should_upgrade = 0;
     info->has_content_length = 0;
-    info->chunked_count = 0;
-    info->has_te_after_chunked = 0;
-    info->has_unknown_te = 0;
+    info->has_te = 0;
+    info->te_error = PICO_TE_OK;
     info->te_forces_close = 0;
     info->singleton_seen = 0;
     info->duplicate_singleton = -1;
@@ -425,21 +434,25 @@ pico_validate_header_framing(PicoHeaderInfo *info, int minor_version,
         return -1;
     }
 
-    /* Check for unknown Transfer-Encoding */
-    if (info->has_unknown_te) {
+    /* The first bad coding in the list decides, as in gunicorn's parsers */
+    switch (info->te_error) {
+    case PICO_TE_UNKNOWN:
         PyErr_SetString(InvalidHeader, "Unsupported Transfer-Encoding");
         return -1;
-    }
-
-    /* Check for stacked chunked encoding */
-    if (info->chunked_count > 0) {
+    case PICO_TE_STACKED:
         PyErr_SetString(InvalidHeader, "Stacked chunked encoding");
+        return -1;
+    case PICO_TE_AFTER_CHUNKED:
+        PyErr_SetString(InvalidHeader, "Invalid Transfer-Encoding after chunked");
         return -1;
     }
 
-    /* Check for Transfer-Encoding value after chunked */
-    if (info->has_te_after_chunked) {
-        PyErr_SetString(InvalidHeader, "Invalid Transfer-Encoding after chunked");
+    /* RFC 9112 section 6.3: if a request's Transfer-Encoding does not end
+     * with chunked, its body length cannot be determined and the server
+     * MUST answer 400, whatever Content-Length says. */
+    if (info->has_te && !info->has_chunked) {
+        PyErr_SetString(InvalidHeader,
+            "Transfer-Encoding does not end with chunked");
         return -1;
     }
 

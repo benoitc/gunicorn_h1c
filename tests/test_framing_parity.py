@@ -5,12 +5,18 @@ RFC 9112 section 7.1.1 (chunk extension grammar, BWS before ";") and section
 6.3 (a request's Transfer-Encoding must end with chunked).
 """
 
+import functools
+
 import pytest
+from gunicorn_h1c._parser_fast import ParseError as FastParseError
 from gunicorn_h1c._protocol import ParseError as ProtocolParseError
 
+import gunicorn_h1c
 from gunicorn_h1c import (
     H1CProtocol,
     InvalidChunkExtension,
+    InvalidHeader,
+    ParseError,
 )
 
 HEAD = b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n"
@@ -127,3 +133,96 @@ def test_bws_before_first_semicolon_accepted(size_line, bytewise):
 def test_whitespace_without_extension_rejected(size_line):
     with pytest.raises(ProtocolParseError, match="chunk size"):
         feed(chunked(size_line))
+
+
+# 3 and 4. Transfer-Encoding
+
+
+def post(*te_lines, extra=b"", body=b"", version=b"1.1"):
+    head = b"POST / HTTP/" + version + b"\r\nHost: a\r\n"
+    for te in te_lines:
+        head += b"Transfer-Encoding: " + te + b"\r\n"
+    return head + extra + b"\r\n" + body
+
+
+BODY = b"1\r\nx\r\n0\r\n\r\n"
+
+ONE_SHOT = [
+    "parse_request",
+    "parse_request_fast",
+    "parse_to_wsgi_environ",
+    "parse_to_asgi_scope",
+]
+REJECTED = (ParseError, FastParseError, ProtocolParseError)
+
+
+def all_entry_points(data):
+    """Yield (name, call) for every entry point that parses a request head."""
+    for name in ONE_SHOT:
+        yield name, functools.partial(getattr(gunicorn_h1c, name), data)
+    for bytewise in (False, True):
+        yield (
+            f"H1CProtocol bytewise={bytewise}",
+            functools.partial(feed, data, bytewise),
+        )
+
+
+NOT_ENDING_WITH_CHUNKED = {
+    "gzip": post(b"gzip"),
+    "deflate": post(b"deflate"),
+    "compress": post(b"compress"),
+    "identity": post(b"identity"),
+    "gzip, identity": post(b"gzip, identity"),
+    "gzip with Content-Length": post(
+        b"gzip", extra=b"Content-Length: 3\r\n", body=b"abc"
+    ),
+    "chunked then gzip on two lines": post(b"chunked", b"gzip", body=BODY),
+}
+
+ENDING_WITH_CHUNKED = {
+    "chunked": post(b"chunked", body=BODY),
+    "gzip, chunked": post(b"gzip, chunked", body=BODY),
+    "deflate, chunked": post(b"deflate, chunked", body=BODY),
+    "identity, chunked": post(b"identity, chunked", body=BODY),
+    "gzip then chunked on two lines": post(b"gzip", b"chunked", body=BODY),
+}
+
+STAYS_400 = {
+    "stacked chunked": post(b"chunked, chunked", body=BODY),
+    "coding after chunked": post(b"chunked, gzip", body=BODY),
+    "chunked on HTTP/1.0": post(b"chunked", body=BODY, version=b"1.0"),
+    "Content-Length with chunked": post(
+        b"chunked", extra=b"Content-Length: 3\r\n", body=BODY
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "data", NOT_ENDING_WITH_CHUNKED.values(), ids=NOT_ENDING_WITH_CHUNKED.keys()
+)
+def test_transfer_encoding_not_ending_with_chunked_rejected(data):
+    for name, call in all_entry_points(data):
+        with pytest.raises(InvalidHeader):
+            call()
+            pytest.fail(name)
+
+
+@pytest.mark.parametrize(
+    "data", ENDING_WITH_CHUNKED.values(), ids=ENDING_WITH_CHUNKED.keys()
+)
+def test_transfer_encoding_ending_with_chunked_accepted(data):
+    for _name, call in all_entry_points(data):
+        call()
+
+
+def test_not_ending_with_chunked_message():
+    with pytest.raises(InvalidHeader, match="does not end with chunked"):
+        feed(post(b"gzip"))
+
+
+@pytest.mark.parametrize("data", STAYS_400.values(), ids=STAYS_400.keys())
+def test_other_transfer_encoding_errors_stay_invalid_header(data):
+    for name, call in all_entry_points(data):
+        with pytest.raises(InvalidHeader):
+            call()
+            pytest.fail(name)
