@@ -53,6 +53,7 @@ __all__ = [
     "InvalidHeaderName",
     "InvalidHeader",
     "InvalidChunkExtension",
+    "UnsupportedTransferCoding",
 ]
 
 # Import from C extensions
@@ -67,6 +68,7 @@ try:
         LimitRequestHeaders,
         LimitRequestLine,
         ParseError,
+        UnsupportedTransferCoding,
         parse_headers,
         parse_request,
         parse_response,

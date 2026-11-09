@@ -143,6 +143,106 @@ CASES = [
     ),
     (
         "parse_request",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: foo, chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n",
+        {},
+    ),
+    (
+        "parse_request_fast",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: foo, chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n",
+        {},
+    ),
+    (
+        "parse_to_wsgi_environ",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: foo, chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n",
+        {},
+    ),
+    (
+        "parse_to_asgi_scope",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: foo, chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n",
+        {},
+    ),
+    (
+        "parse_request",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: x-gzip, chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n",
+        {},
+    ),
+    (
+        "parse_request_fast",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: x-gzip, chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n",
+        {},
+    ),
+    (
+        "parse_to_wsgi_environ",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: x-gzip, chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n",
+        {},
+    ),
+    (
+        "parse_to_asgi_scope",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: x-gzip, chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n",
+        {},
+    ),
+    (
+        "parse_request",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked;q=1\r\n\r\n1\r\nx\r\n0\r\n\r\n",
+        {},
+    ),
+    (
+        "parse_request_fast",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked;q=1\r\n\r\n1\r\nx\r\n0\r\n\r\n",
+        {},
+    ),
+    (
+        "parse_to_wsgi_environ",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked;q=1\r\n\r\n1\r\nx\r\n0\r\n\r\n",
+        {},
+    ),
+    (
+        "parse_to_asgi_scope",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked;q=1\r\n\r\n1\r\nx\r\n0\r\n\r\n",
+        {},
+    ),
+    (
+        "parse_request",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: , chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n",
+        {},
+    ),
+    (
+        "parse_request_fast",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: , chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n",
+        {},
+    ),
+    (
+        "parse_to_wsgi_environ",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: , chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n",
+        {},
+    ),
+    (
+        "parse_to_asgi_scope",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: , chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n",
+        {},
+    ),
+    (
+        "parse_request",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: foo\r\n\r\n",
+        {},
+    ),
+    (
+        "parse_request_fast",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: foo\r\n\r\n",
+        {},
+    ),
+    (
+        "parse_to_wsgi_environ",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: foo\r\n\r\n",
+        {},
+    ),
+    (
+        "parse_to_asgi_scope",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: foo\r\n\r\n",
+        {},
+    ),
+    (
+        "parse_request",
         b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked, chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n",
         {},
     ),

@@ -1,8 +1,9 @@
 """Chunk extensions and Transfer-Encoding, checked as gunicorn's Python
 parsers check them, on every entry point and however the request is split.
 
-RFC 9112 section 7.1.1 (chunk extension grammar, BWS before ";") and section
-6.3 (a request's Transfer-Encoding must end with chunked).
+RFC 9112 section 7.1.1 (chunk extension grammar, BWS before ";"), section 6.3
+(a request's Transfer-Encoding must end with chunked) and section 6.1 (a
+coding the server does not understand: 501).
 """
 
 import functools
@@ -187,6 +188,14 @@ ENDING_WITH_CHUNKED = {
     "gzip then chunked on two lines": post(b"gzip", b"chunked", body=BODY),
 }
 
+UNKNOWN = {
+    "foo, chunked": post(b"foo, chunked", body=BODY),
+    "x-gzip, chunked": post(b"x-gzip, chunked", body=BODY),
+    "parameter": post(b"chunked;q=1", body=BODY),
+    "empty member": post(b", chunked", body=BODY),
+    "foo alone": post(b"foo"),
+}
+
 STAYS_400 = {
     "stacked chunked": post(b"chunked, chunked", body=BODY),
     "coding after chunked": post(b"chunked, gzip", body=BODY),
@@ -202,9 +211,12 @@ STAYS_400 = {
 )
 def test_transfer_encoding_not_ending_with_chunked_rejected(data):
     for name, call in all_entry_points(data):
-        with pytest.raises(InvalidHeader):
+        with pytest.raises(InvalidHeader) as excinfo:
             call()
             pytest.fail(name)
+        assert not isinstance(excinfo.value, gunicorn_h1c.UnsupportedTransferCoding), (
+            name
+        )
 
 
 @pytest.mark.parametrize(
@@ -220,9 +232,36 @@ def test_not_ending_with_chunked_message():
         feed(post(b"gzip"))
 
 
+@pytest.mark.parametrize("data", UNKNOWN.values(), ids=UNKNOWN.keys())
+def test_unknown_coding_is_unsupported(data):
+    for name, call in all_entry_points(data):
+        with pytest.raises(gunicorn_h1c.UnsupportedTransferCoding):
+            call()
+            pytest.fail(name)
+
+
 @pytest.mark.parametrize("data", STAYS_400.values(), ids=STAYS_400.keys())
 def test_other_transfer_encoding_errors_stay_invalid_header(data):
     for name, call in all_entry_points(data):
-        with pytest.raises(InvalidHeader):
+        with pytest.raises(InvalidHeader) as excinfo:
             call()
             pytest.fail(name)
+        assert not isinstance(excinfo.value, gunicorn_h1c.UnsupportedTransferCoding), (
+            name
+        )
+
+
+def test_errors_follow_the_order_of_the_codings():
+    """As in gunicorn: the first bad coding in the list decides."""
+    with pytest.raises(InvalidHeader) as excinfo:
+        feed(post(b"chunked, chunked, foo", body=BODY))
+    assert not isinstance(excinfo.value, gunicorn_h1c.UnsupportedTransferCoding)
+    with pytest.raises(gunicorn_h1c.UnsupportedTransferCoding):
+        feed(post(b"foo, chunked, chunked", body=BODY))
+
+
+def test_unsupported_transfer_coding_class():
+    cls = gunicorn_h1c.UnsupportedTransferCoding
+    assert issubclass(cls, InvalidHeader)
+    assert issubclass(cls, ParseError)
+    assert "UnsupportedTransferCoding" in gunicorn_h1c.__all__

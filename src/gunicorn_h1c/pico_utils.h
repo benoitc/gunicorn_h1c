@@ -90,6 +90,12 @@ typedef struct {
 #define PICO_TE_AFTER_CHUNKED 3  /* a coding after chunked */
 
 /*
+ * UnsupportedTransferCoding (a subclass of InvalidHeader), set by each
+ * extension module when it is imported. Falls back to InvalidHeader.
+ */
+static PyObject *PicoUnsupportedTransferCoding = NULL;
+
+/*
  * Case-insensitive header name comparison.
  * Target must be lowercase.
  */
@@ -437,7 +443,11 @@ pico_validate_header_framing(PicoHeaderInfo *info, int minor_version,
     /* The first bad coding in the list decides, as in gunicorn's parsers */
     switch (info->te_error) {
     case PICO_TE_UNKNOWN:
-        PyErr_SetString(InvalidHeader, "Unsupported Transfer-Encoding");
+        /* RFC 9112 section 6.1: a coding the server does not understand
+         * SHOULD get 501 (Not Implemented). */
+        PyErr_SetString(PicoUnsupportedTransferCoding
+                        ? PicoUnsupportedTransferCoding : InvalidHeader,
+                        "Unsupported Transfer-Encoding");
         return -1;
     case PICO_TE_STACKED:
         PyErr_SetString(InvalidHeader, "Stacked chunked encoding");
