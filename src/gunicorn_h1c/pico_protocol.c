@@ -1062,6 +1062,13 @@ H1CProtocol_chunk_size_line(H1CProtocol *self, const char *line, size_t line_len
                 "Invalid chunk extension: bare CR not allowed");
             return -1;
         }
+        /* RFC 9112 section 7.1.1: BWS may come before each ";", the first
+         * one included, so only there may the size be followed by SP or
+         * HTAB. */
+        while (size_len > 0 &&
+               (line[size_len - 1] == ' ' || line[size_len - 1] == '\t')) {
+            size_len--;
+        }
     }
 
     /* Reject empty chunk size */

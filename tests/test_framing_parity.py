@@ -97,3 +97,33 @@ def test_long_extension_is_linear():
     p.feed(chunked(line))
     assert p.is_complete
     assert time.perf_counter() - start < 0.5
+
+
+# 2. BWS before the first ";"
+
+BWS_ACCEPTED = {
+    "SP before ;": b"1 ;a",
+    "HTAB before ;": b"1\t;a",
+    "BWS everywhere": b"1 ; a = b",
+}
+WHITESPACE_REJECTED = {
+    "trailing SP": b"1 ",
+    "leading SP": b" 1",
+    "SP inside size": b"1 2;a",
+}
+
+
+@BYTEWISE
+@pytest.mark.parametrize("size_line", BWS_ACCEPTED.values(), ids=BWS_ACCEPTED.keys())
+def test_bws_before_first_semicolon_accepted(size_line, bytewise):
+    p, body = feed(chunked(size_line), bytewise)
+    assert p.is_complete
+    assert body == b"x"
+
+
+@pytest.mark.parametrize(
+    "size_line", WHITESPACE_REJECTED.values(), ids=WHITESPACE_REJECTED.keys()
+)
+def test_whitespace_without_extension_rejected(size_line):
+    with pytest.raises(ProtocolParseError, match="chunk size"):
+        feed(chunked(size_line))
