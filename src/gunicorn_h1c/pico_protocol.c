@@ -1055,9 +1055,16 @@ H1CProtocol_chunk_size_line(H1CProtocol *self, const char *line, size_t line_len
     const char *semicolon = memchr(line, ';', line_len);
     size_t size_len = semicolon ? (size_t)(semicolon - line) : line_len;
 
+    /* One pass over the extension; its error is reported after the size,
+     * so a bad size is reported as such. A CR is never valid there, so only
+     * a failed extension can hold a bare CR, and only from its first bad
+     * byte on: that one is reported first, as gunicorn does. */
+    const unsigned char *line_end = (const unsigned char *)line + line_len;
+    const unsigned char *bad = NULL;
     if (semicolon) {
-        /* RFC 9112: chunk-ext must not contain bare CR */
-        if (memchr(semicolon + 1, '\r', line_len - size_len - 1)) {
+        bad = pico_chunk_ext_error((const unsigned char *)semicolon, line_end);
+        if (bad && bad < line_end &&
+            memchr(bad, '\r', (size_t)(line_end - bad))) {
             PyErr_SetString(InvalidChunkExtension,
                 "Invalid chunk extension: bare CR not allowed");
             return -1;
@@ -1111,14 +1118,9 @@ H1CProtocol_chunk_size_line(H1CProtocol *self, const char *line, size_t line_len
 
     /* The extension after the size, so a bad size is reported as such */
     if (semicolon) {
-        const unsigned char *bad = pico_chunk_ext_error(
-            (const unsigned char *)semicolon,
-            (const unsigned char *)line + line_len);
         if (bad) {
-            unsigned char c = bad < (const unsigned char *)line + line_len
-                ? *bad : 0;
-            if (bad < (const unsigned char *)line + line_len &&
-                ((c < 0x20 && c != '\t') || c == 0x7f)) {
+            unsigned char c = bad < line_end ? *bad : 0;
+            if (bad < line_end && ((c < 0x20 && c != '\t') || c == 0x7f)) {
                 PyErr_Format(InvalidChunkExtension,
                     "Invalid chunk extension: control character '\\x%02x' "
                     "not allowed (RFC 9112 section 7.1.1)", c);

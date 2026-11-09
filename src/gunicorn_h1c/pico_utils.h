@@ -885,6 +885,30 @@ pico_check_request_line(const char *buf, size_t buf_len, int ret,
 }
 
 /*
+ * qdtext = HTAB / SP / %x21 / %x23-5B / %x5D-7E / obs-text (RFC 9110
+ * section 5.6.4): every byte but the controls other than HTAB, DQUOTE,
+ * backslash and DEL.
+ */
+static const unsigned char pico_qdtext_chars[256] = {
+    /* 0x00 */ 0,0,0,0,0,0,0,0, 0,1,0,0,0,0,0,0,
+    /* 0x10 */ 0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,
+    /* 0x20 */ 1,1,0,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+    /* 0x30 */ 1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+    /* 0x40 */ 1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+    /* 0x50 */ 1,1,1,1,1,1,1,1, 1,1,1,1,0,1,1,1,
+    /* 0x60 */ 1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+    /* 0x70 */ 1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,0,
+    /* 0x80 */ 1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+    /* 0x90 */ 1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+    /* 0xa0 */ 1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+    /* 0xb0 */ 1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+    /* 0xc0 */ 1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+    /* 0xd0 */ 1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+    /* 0xe0 */ 1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+    /* 0xf0 */ 1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+};
+
+/*
  * RFC 9112 section 7.1.1, from the first ";" of a chunk size line:
  *
  *   chunk-ext      = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )
@@ -928,10 +952,7 @@ pico_chunk_ext_error(const unsigned char *p, const unsigned char *end)
                         if (!(c == '\t' || (c >= 0x20 && c != 0x7f))) return p;
                         continue;
                     }
-                    /* qdtext = HTAB / SP / %x21 / %x23-5B / %x5D-7E / obs-text */
-                    if (!(c == '\t' || c == ' ' || c == 0x21 ||
-                          (c >= 0x23 && c <= 0x5b) || (c >= 0x5d && c <= 0x7e) ||
-                          c >= 0x80)) {
+                    if (!pico_qdtext_chars[c]) {
                         return p;
                     }
                 }
