@@ -83,6 +83,7 @@ CASES = {
     "empty Transfer-Encoding": post(b"Transfer-Encoding: \r\n"),
     "Transfer-Encoding gzip,": post(b"Transfer-Encoding: gzip, \r\n"),
     "unknown Transfer-Encoding": post(b"Transfer-Encoding: foo\r\n"),
+    "bad extension": HEAD + b"1;a=b c\r\nx\r\n0\r\n\r\n",
     # limits
     "endless request line": b"GET /" + b"a" * 20000,
     "endless header line": b"GET / HTTP/1.1\r\nX: " + b"a" * 20000,

@@ -862,6 +862,71 @@ pico_check_request_line(const char *buf, size_t buf_len, int ret,
 }
 
 /*
+ * RFC 9112 section 7.1.1, from the first ";" of a chunk size line:
+ *
+ *   chunk-ext      = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )
+ *   chunk-ext-name = token
+ *   chunk-ext-val  = token / quoted-string
+ *
+ * with token and quoted-string from RFC 9110 sections 5.6.2 and 5.6.4. One
+ * pass, the same grammar as CHUNK_EXT_RE in gunicorn/http/body.py. Returns
+ * NULL when the whole range matches, else the first byte that does not
+ * (`end` when the range stops too early, as in an unclosed quote).
+ */
+static inline const unsigned char *
+pico_chunk_ext_error(const unsigned char *p, const unsigned char *end)
+{
+#define PICO_SKIP_BWS() while (p < end && (*p == ' ' || *p == '\t')) p++
+    while (p < end) {
+        PICO_SKIP_BWS();
+        if (p >= end || *p != ';') return p;
+        p++;
+        PICO_SKIP_BWS();
+        const unsigned char *name = p;
+        while (p < end && pico_is_token_char(*p)) p++;
+        if (p == name) return p;
+        const unsigned char *after_name = p;
+        PICO_SKIP_BWS();
+        if (p < end && *p == '=') {
+            p++;
+            PICO_SKIP_BWS();
+            if (p < end && *p == '"') {
+                for (p++;; p++) {
+                    if (p >= end) return p;
+                    unsigned char c = *p;
+                    if (c == '"') {
+                        p++;
+                        break;
+                    }
+                    if (c == '\\') {
+                        /* quoted-pair = "\" ( HTAB / SP / VCHAR / obs-text ) */
+                        if (++p >= end) return p;
+                        c = *p;
+                        if (!(c == '\t' || (c >= 0x20 && c != 0x7f))) return p;
+                        continue;
+                    }
+                    /* qdtext = HTAB / SP / %x21 / %x23-5B / %x5D-7E / obs-text */
+                    if (!(c == '\t' || c == ' ' || c == 0x21 ||
+                          (c >= 0x23 && c <= 0x5b) || (c >= 0x5d && c <= 0x7e) ||
+                          c >= 0x80)) {
+                        return p;
+                    }
+                }
+            } else {
+                const unsigned char *value = p;
+                while (p < end && pico_is_token_char(*p)) p++;
+                if (p == value) return p;
+            }
+        } else {
+            /* whitespace after the name belongs to the next ";" */
+            p = after_name;
+        }
+    }
+    return NULL;
+#undef PICO_SKIP_BWS
+}
+
+/*
  * Size of a header line as gunicorn's Python parsers count it: the line as
  * received, whitespace around the value included, plus CRLF. Only valid on a
  * header parsed by picohttpparser, whose line is followed by CRLF.
