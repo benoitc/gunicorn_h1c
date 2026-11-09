@@ -173,8 +173,9 @@ machine, and report medians with the spread.
   legitimate case precisely.
 - Raise the existing exception types so gunicorn maps them to the right
   status: `LimitRequestLine` (414), `LimitRequestHeaders` (431),
-  `InvalidHeader`, `InvalidHeaderName`, `InvalidRequestMethod`,
-  `InvalidHTTPVersion`, `InvalidChunkExtension` and `ParseError` (400).
+  `UnsupportedTransferCoding` (501), `InvalidHeader`, `InvalidHeaderName`,
+  `InvalidRequestMethod`, `InvalidHTTPVersion`, `InvalidChunkExtension` and
+  `ParseError` (400).
 - Every bug fix and feature has a test. Show it failing on main.
 - Changelog: `CHANGELOG.md`, plain English, what was wrong and what the fix
   does for the user, citing the spec section when there is one. No
