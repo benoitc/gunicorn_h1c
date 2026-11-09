@@ -1500,3 +1500,34 @@ class TestAsgiHeadersSharing:
             assert avalue is value
             if name == name.lower():
                 assert aname is name
+
+
+class TestChunkExtensionControlCharacters:
+    """RFC 9112 section 7.1.1: a chunk extension is made of tokens, quoted
+    strings, "=", ";" and whitespace. None of them admits a control
+    character other than HTAB, nor DEL, so those are rejected."""
+
+    HEAD = b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n"
+
+    @pytest.mark.parametrize(
+        "ext",
+        [b";a\x01", b";a=\x00", b';a="x\x1fy"', b";a\x7f", b";a\x0b", b";\x1b"],
+    )
+    @pytest.mark.parametrize("bytewise", [False, True], ids=["whole", "bytewise"])
+    def test_control_character_rejected(self, ext, bytewise):
+        data = self.HEAD + b"1" + ext + b"\r\nx\r\n0\r\n\r\n"
+        p = H1CProtocol()
+        step = 1 if bytewise else len(data)
+        with pytest.raises(InvalidChunkExtension, match="control character"):
+            for i in range(0, len(data), step):
+                p.feed(data[i : i + step])
+
+    @pytest.mark.parametrize(
+        "ext", [b";a\tb", b";a=b", b'; a = "q\\"x"', b";a=\x80", b';a="\t"']
+    )
+    def test_other_bytes_still_accepted(self, ext):
+        body = []
+        p = H1CProtocol(on_body=body.append)
+        p.feed(self.HEAD + b"1" + ext + b"\r\nx\r\n0\r\n\r\n")
+        assert p.is_complete
+        assert body == [b"x"]

@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.13] - 2026-11-09
+
+### Fixed
+
+- Reject a chunk extension that holds a control character, such as
+  `1;a\x01`. RFC 9112 section 7.1.1 builds an extension from tokens, quoted
+  strings, `;`, `=` and whitespace, and none of them allows a control
+  character other than a tab, nor DEL. `H1CProtocol` only refused a bare CR
+  there and accepted the rest; it now raises `InvalidChunkExtension`, which
+  gunicorn answers with a 400.
+
 ## [0.6.12] - 2026-11-09
 
 ### Fixed

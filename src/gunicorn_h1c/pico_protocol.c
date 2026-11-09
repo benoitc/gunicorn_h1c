@@ -1055,13 +1055,25 @@ H1CProtocol_chunk_size_line(H1CProtocol *self, const char *line, size_t line_len
     const char *semicolon = memchr(line, ';', line_len);
     size_t size_len = semicolon ? (size_t)(semicolon - line) : line_len;
 
-    /* RFC 9112: chunk-ext must not contain bare CR */
+    /* RFC 9112 section 7.1.1: chunk-ext is made of tokens, quoted strings
+     * (RFC 9110 section 5.6.4), "=", ";" and whitespace. None of them
+     * admits a control character other than HTAB, nor DEL. */
     if (semicolon) {
+        const unsigned char *ext = (const unsigned char *)semicolon + 1;
         size_t ext_len = line_len - size_len - 1;
-        if (memchr(semicolon + 1, '\r', ext_len)) {
-            PyErr_SetString(InvalidChunkExtension,
-                "Invalid chunk extension: bare CR not allowed");
-            return -1;
+        for (size_t i = 0; i < ext_len; i++) {
+            unsigned char c = ext[i];
+            if (c == '\r') {
+                PyErr_SetString(InvalidChunkExtension,
+                    "Invalid chunk extension: bare CR not allowed");
+                return -1;
+            }
+            if ((c < 0x20 && c != '\t') || c == 0x7f) {
+                PyErr_Format(InvalidChunkExtension,
+                    "Invalid chunk extension: control character '\\x%02x' "
+                    "not allowed (RFC 9112 section 7.1.1)", c);
+                return -1;
+            }
         }
     }
 
