@@ -1505,7 +1505,8 @@ class TestAsgiHeadersSharing:
 class TestChunkExtensionControlCharacters:
     """RFC 9112 section 7.1.1: a chunk extension is made of tokens, quoted
     strings, "=", ";" and whitespace. None of them admits a control
-    character other than HTAB, nor DEL, so those are rejected."""
+    character other than HTAB, nor DEL, so those are rejected. The rest of
+    the grammar is tested in test_framing_parity.py."""
 
     HEAD = b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n"
 
@@ -1523,7 +1524,7 @@ class TestChunkExtensionControlCharacters:
                 p.feed(data[i : i + step])
 
     @pytest.mark.parametrize(
-        "ext", [b";a\tb", b";a=b", b'; a = "q\\"x"', b";a=\x80", b';a="\t"']
+        "ext", [b";a=b", b'; a = "q\\"x"', b';a="\x80"', b';a="\t"', b";a\t;b"]
     )
     def test_other_bytes_still_accepted(self, ext):
         body = []

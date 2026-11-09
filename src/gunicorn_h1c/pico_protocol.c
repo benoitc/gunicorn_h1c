@@ -1055,25 +1055,26 @@ H1CProtocol_chunk_size_line(H1CProtocol *self, const char *line, size_t line_len
     const char *semicolon = memchr(line, ';', line_len);
     size_t size_len = semicolon ? (size_t)(semicolon - line) : line_len;
 
-    /* RFC 9112 section 7.1.1: chunk-ext is made of tokens, quoted strings
-     * (RFC 9110 section 5.6.4), "=", ";" and whitespace. None of them
-     * admits a control character other than HTAB, nor DEL. */
+    /* One pass over the extension; its error is reported after the size,
+     * so a bad size is reported as such. A CR is never valid there, so only
+     * a failed extension can hold a bare CR, and only from its first bad
+     * byte on: that one is reported first, as gunicorn does. */
+    const unsigned char *line_end = (const unsigned char *)line + line_len;
+    const unsigned char *bad = NULL;
     if (semicolon) {
-        const unsigned char *ext = (const unsigned char *)semicolon + 1;
-        size_t ext_len = line_len - size_len - 1;
-        for (size_t i = 0; i < ext_len; i++) {
-            unsigned char c = ext[i];
-            if (c == '\r') {
-                PyErr_SetString(InvalidChunkExtension,
-                    "Invalid chunk extension: bare CR not allowed");
-                return -1;
-            }
-            if ((c < 0x20 && c != '\t') || c == 0x7f) {
-                PyErr_Format(InvalidChunkExtension,
-                    "Invalid chunk extension: control character '\\x%02x' "
-                    "not allowed (RFC 9112 section 7.1.1)", c);
-                return -1;
-            }
+        bad = pico_chunk_ext_error((const unsigned char *)semicolon, line_end);
+        if (bad && bad < line_end &&
+            memchr(bad, '\r', (size_t)(line_end - bad))) {
+            PyErr_SetString(InvalidChunkExtension,
+                "Invalid chunk extension: bare CR not allowed");
+            return -1;
+        }
+        /* RFC 9112 section 7.1.1: BWS may come before each ";", the first
+         * one included, so only there may the size be followed by SP or
+         * HTAB. */
+        while (size_len > 0 &&
+               (line[size_len - 1] == ' ' || line[size_len - 1] == '\t')) {
+            size_len--;
         }
     }
 
@@ -1113,6 +1114,22 @@ H1CProtocol_chunk_size_line(H1CProtocol *self, const char *line, size_t line_len
             return -1;
         }
         chunk_size = chunk_size * 16 + digit;
+    }
+
+    /* The extension after the size, so a bad size is reported as such */
+    if (semicolon) {
+        if (bad) {
+            unsigned char c = bad < line_end ? *bad : 0;
+            if (bad < line_end && ((c < 0x20 && c != '\t') || c == 0x7f)) {
+                PyErr_Format(InvalidChunkExtension,
+                    "Invalid chunk extension: control character '\\x%02x' "
+                    "not allowed (RFC 9112 section 7.1.1)", c);
+            } else {
+                PyErr_SetString(InvalidChunkExtension,
+                    "Invalid chunk extension (RFC 9112 section 7.1.1)");
+            }
+            return -1;
+        }
     }
 
     self->chunk_size = chunk_size;
@@ -2012,6 +2029,10 @@ PyInit__protocol(void)
 
     InvalidHeader = PyObject_GetAttrString(parser_module, "InvalidHeader");
     if (!InvalidHeader) { Py_DECREF(parser_module); return NULL; }
+
+    PicoUnsupportedTransferCoding = PyObject_GetAttrString(
+        parser_module, "UnsupportedTransferCoding");
+    if (!PicoUnsupportedTransferCoding) { Py_DECREF(parser_module); return NULL; }
 
     InvalidChunkExtension = PyObject_GetAttrString(parser_module, "InvalidChunkExtension");
     if (!InvalidChunkExtension) { Py_DECREF(parser_module); return NULL; }

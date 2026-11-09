@@ -1105,6 +1105,16 @@ PyInit__parser(void)
     Py_INCREF(InvalidChunkExtension);
     PyModule_AddObject(m, "InvalidChunkExtension", InvalidChunkExtension);
 
+    /* RFC 9112 section 6.1: a transfer coding the server does not
+     * understand, which gunicorn answers with 501. A subclass of
+     * InvalidHeader, so code that catches that keeps working. */
+    PicoUnsupportedTransferCoding = PyErr_NewException(
+        "gunicorn_h1c._parser.UnsupportedTransferCoding", InvalidHeader, NULL);
+    if (!PicoUnsupportedTransferCoding) goto error;
+    Py_INCREF(PicoUnsupportedTransferCoding);
+    PyModule_AddObject(m, "UnsupportedTransferCoding",
+                       PicoUnsupportedTransferCoding);
+
     return m;
 
 error:

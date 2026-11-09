@@ -28,7 +28,7 @@ Usage:
     print(req.has_chunked)    # False
 """
 
-__version__ = "0.6.13"
+__version__ = "0.6.14"
 __all__ = [
     # Basic parser
     "parse_request",
@@ -53,6 +53,7 @@ __all__ = [
     "InvalidHeaderName",
     "InvalidHeader",
     "InvalidChunkExtension",
+    "UnsupportedTransferCoding",
 ]
 
 # Import from C extensions
@@ -67,6 +68,7 @@ try:
         LimitRequestHeaders,
         LimitRequestLine,
         ParseError,
+        UnsupportedTransferCoding,
         parse_headers,
         parse_request,
         parse_response,

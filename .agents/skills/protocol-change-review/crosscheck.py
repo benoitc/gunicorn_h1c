@@ -59,9 +59,6 @@ CASES = {
     "gzip, chunked": post(
         b"Transfer-Encoding: gzip, chunked\r\n", b"3\r\nabc\r\n0\r\n\r\n"
     ),
-    "identity + Content-Length": post(
-        b"Transfer-Encoding: identity\r\nContent-Length: 3\r\n", b"abc"
-    ),
     "100 headers": b"GET / HTTP/1.1\r\n" + b"X-H: 1\r\n" * 100 + b"\r\n",
     # line terminators (RFC 9112 section 2.2)
     "bare LF everywhere": b"GET / HTTP/1.1\nHost: a\nX: 1\n\n",
@@ -83,6 +80,12 @@ CASES = {
     "empty Transfer-Encoding": post(b"Transfer-Encoding: \r\n"),
     "Transfer-Encoding gzip,": post(b"Transfer-Encoding: gzip, \r\n"),
     "unknown Transfer-Encoding": post(b"Transfer-Encoding: foo\r\n"),
+    "identity + Content-Length": post(
+        b"Transfer-Encoding: identity\r\nContent-Length: 3\r\n", b"abc"
+    ),
+    "gzip, no chunked": post(b"Transfer-Encoding: gzip\r\n"),
+    "BWS before first ;": HEAD + b"1 ;a\r\nx\r\n0\r\n\r\n",
+    "bad extension": HEAD + b"1;a=b c\r\nx\r\n0\r\n\r\n",
     # limits
     "endless request line": b"GET /" + b"a" * 20000,
     "endless header line": b"GET / HTTP/1.1\r\nX: " + b"a" * 20000,

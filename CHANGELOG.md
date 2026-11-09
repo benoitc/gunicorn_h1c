@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.14] - 2026-11-09
+
+### Fixed
+
+- Check the whole chunk extension grammar of RFC 9112 section 7.1.1.
+  `1;a=b c`, `1;=b`, `1;`, `1;a="b`, `1;a@b`, `1;a=` and `1;a ` (whitespace
+  after the last extension) were accepted; they are now an
+  `InvalidChunkExtension`, as in gunicorn's Python parsers. An invalid size
+  is still reported as a chunk size error.
+- Accept whitespace before the first `;` of a chunk size line, such as
+  `1 ;a`, which RFC 9112 section 7.1.1 allows and gunicorn accepts.
+- Reject a request whose `Transfer-Encoding` does not end with `chunked`,
+  such as `gzip` or `identity` alone (RFC 9112 section 6.3). Such a request
+  was accepted with an empty body, or framed by `Content-Length`; it is now
+  an `InvalidHeader`, which gunicorn answers with 400.
+
+### Added
+
+- `UnsupportedTransferCoding`, raised for a transfer coding gunicorn_h1c does
+  not understand, such as `foo, chunked` or `chunked;q=1`, so gunicorn can
+  answer 501 as RFC 9112 section 6.1 recommends. It is a subclass of
+  `InvalidHeader`, so code that catches that keeps working.
+
+### Changed
+
+- When a `Transfer-Encoding` list has several faults, the first one in the
+  list decides the error, as in gunicorn's Python parsers.
+
 ## [0.6.13] - 2026-11-09
 
 ### Fixed

@@ -76,13 +76,24 @@ typedef struct {
     int connection_close;       /* -1=unset, 0=keep-alive, 1=close */
     int should_upgrade;         /* 1 if Upgrade header present */
     int has_content_length;     /* 1 if Content-Length header present */
-    int chunked_count;          /* Number of "chunked" values seen */
-    int has_te_after_chunked;   /* 1 if T-E value after chunked */
-    int has_unknown_te;         /* 1 if unknown Transfer-Encoding value */
+    int has_te;                 /* 1 if a Transfer-Encoding field is present */
+    int te_error;               /* first PICO_TE_* error, in list order */
     int te_forces_close;        /* 1 if a compression coding was seen */
     unsigned int singleton_seen; /* Bitmask of pico_singleton_fields seen */
     int duplicate_singleton;    /* Index of first repeated singleton, -1 if none */
 } PicoHeaderInfo;
+
+/* Transfer-Encoding errors, recorded in the order the codings appear */
+#define PICO_TE_OK 0
+#define PICO_TE_UNKNOWN 1        /* not a coding we understand: 501 */
+#define PICO_TE_STACKED 2        /* chunked twice */
+#define PICO_TE_AFTER_CHUNKED 3  /* a coding after chunked */
+
+/*
+ * UnsupportedTransferCoding (a subclass of InvalidHeader), set by each
+ * extension module when it is imported. Falls back to InvalidHeader.
+ */
+static PyObject *PicoUnsupportedTransferCoding = NULL;
 
 /*
  * Case-insensitive header name comparison.
@@ -279,6 +290,10 @@ pico_parse_transfer_encoding(const char *value, size_t value_len, PicoHeaderInfo
     const char *p = value;
     const char *end = value + value_len;
 
+    info->has_te = 1;
+#define PICO_TE_FAIL(kind) \
+    do { if (info->te_error == PICO_TE_OK) info->te_error = (kind); } while (0)
+
     while (1) {
         const char *token_start = p;
         const char *token_end = p;
@@ -293,14 +308,14 @@ pico_parse_transfer_encoding(const char *value, size_t value_len, PicoHeaderInfo
         if (te_type == 1) {
             /* chunked */
             if (info->has_chunked) {
-                info->chunked_count++;  /* Stacked chunked */
+                PICO_TE_FAIL(PICO_TE_STACKED);
             }
             info->has_chunked = 1;
         }
         else if (te_type == 2 || te_type == 3) {
             /* identity, gzip, deflate, compress */
             if (info->has_chunked) {
-                info->has_te_after_chunked = 1;  /* T-E value after chunked */
+                PICO_TE_FAIL(PICO_TE_AFTER_CHUNKED);
             }
             if (te_type == 3) {
                 /* Not decoded here, so the length of the body is unknown:
@@ -310,8 +325,8 @@ pico_parse_transfer_encoding(const char *value, size_t value_len, PicoHeaderInfo
             }
         }
         else {
-            /* Unknown or empty transfer coding */
-            info->has_unknown_te = 1;
+            /* Unknown or empty transfer coding, or one with parameters */
+            PICO_TE_FAIL(PICO_TE_UNKNOWN);
         }
 
         if (token_end >= end) {
@@ -319,6 +334,7 @@ pico_parse_transfer_encoding(const char *value, size_t value_len, PicoHeaderInfo
         }
         p = token_end + 1;  /* past the comma */
     }
+#undef PICO_TE_FAIL
 }
 
 /*
@@ -336,9 +352,8 @@ pico_extract_headers(struct phr_header *headers, size_t num_headers,
     info->connection_close = -1;
     info->should_upgrade = 0;
     info->has_content_length = 0;
-    info->chunked_count = 0;
-    info->has_te_after_chunked = 0;
-    info->has_unknown_te = 0;
+    info->has_te = 0;
+    info->te_error = PICO_TE_OK;
     info->te_forces_close = 0;
     info->singleton_seen = 0;
     info->duplicate_singleton = -1;
@@ -425,21 +440,29 @@ pico_validate_header_framing(PicoHeaderInfo *info, int minor_version,
         return -1;
     }
 
-    /* Check for unknown Transfer-Encoding */
-    if (info->has_unknown_te) {
-        PyErr_SetString(InvalidHeader, "Unsupported Transfer-Encoding");
+    /* The first bad coding in the list decides, as in gunicorn's parsers */
+    switch (info->te_error) {
+    case PICO_TE_UNKNOWN:
+        /* RFC 9112 section 6.1: a coding the server does not understand
+         * SHOULD get 501 (Not Implemented). */
+        PyErr_SetString(PicoUnsupportedTransferCoding
+                        ? PicoUnsupportedTransferCoding : InvalidHeader,
+                        "Unsupported Transfer-Encoding");
         return -1;
-    }
-
-    /* Check for stacked chunked encoding */
-    if (info->chunked_count > 0) {
+    case PICO_TE_STACKED:
         PyErr_SetString(InvalidHeader, "Stacked chunked encoding");
         return -1;
+    case PICO_TE_AFTER_CHUNKED:
+        PyErr_SetString(InvalidHeader, "Invalid Transfer-Encoding after chunked");
+        return -1;
     }
 
-    /* Check for Transfer-Encoding value after chunked */
-    if (info->has_te_after_chunked) {
-        PyErr_SetString(InvalidHeader, "Invalid Transfer-Encoding after chunked");
+    /* RFC 9112 section 6.3: if a request's Transfer-Encoding does not end
+     * with chunked, its body length cannot be determined and the server
+     * MUST answer 400, whatever Content-Length says. */
+    if (info->has_te && !info->has_chunked) {
+        PyErr_SetString(InvalidHeader,
+            "Transfer-Encoding does not end with chunked");
         return -1;
     }
 
@@ -859,6 +882,92 @@ pico_check_request_line(const char *buf, size_t buf_len, int ret,
         return -1;
     }
     return 0;
+}
+
+/*
+ * qdtext = HTAB / SP / %x21 / %x23-5B / %x5D-7E / obs-text (RFC 9110
+ * section 5.6.4): every byte but the controls other than HTAB, DQUOTE,
+ * backslash and DEL.
+ */
+static const unsigned char pico_qdtext_chars[256] = {
+    /* 0x00 */ 0,0,0,0,0,0,0,0, 0,1,0,0,0,0,0,0,
+    /* 0x10 */ 0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,
+    /* 0x20 */ 1,1,0,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+    /* 0x30 */ 1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+    /* 0x40 */ 1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+    /* 0x50 */ 1,1,1,1,1,1,1,1, 1,1,1,1,0,1,1,1,
+    /* 0x60 */ 1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+    /* 0x70 */ 1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,0,
+    /* 0x80 */ 1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+    /* 0x90 */ 1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+    /* 0xa0 */ 1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+    /* 0xb0 */ 1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+    /* 0xc0 */ 1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+    /* 0xd0 */ 1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+    /* 0xe0 */ 1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+    /* 0xf0 */ 1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,
+};
+
+/*
+ * RFC 9112 section 7.1.1, from the first ";" of a chunk size line:
+ *
+ *   chunk-ext      = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )
+ *   chunk-ext-name = token
+ *   chunk-ext-val  = token / quoted-string
+ *
+ * with token and quoted-string from RFC 9110 sections 5.6.2 and 5.6.4. One
+ * pass, the same grammar as CHUNK_EXT_RE in gunicorn/http/body.py. Returns
+ * NULL when the whole range matches, else the first byte that does not
+ * (`end` when the range stops too early, as in an unclosed quote).
+ */
+static inline const unsigned char *
+pico_chunk_ext_error(const unsigned char *p, const unsigned char *end)
+{
+#define PICO_SKIP_BWS() while (p < end && (*p == ' ' || *p == '\t')) p++
+    while (p < end) {
+        PICO_SKIP_BWS();
+        if (p >= end || *p != ';') return p;
+        p++;
+        PICO_SKIP_BWS();
+        const unsigned char *name = p;
+        while (p < end && pico_is_token_char(*p)) p++;
+        if (p == name) return p;
+        const unsigned char *after_name = p;
+        PICO_SKIP_BWS();
+        if (p < end && *p == '=') {
+            p++;
+            PICO_SKIP_BWS();
+            if (p < end && *p == '"') {
+                for (p++;; p++) {
+                    if (p >= end) return p;
+                    unsigned char c = *p;
+                    if (c == '"') {
+                        p++;
+                        break;
+                    }
+                    if (c == '\\') {
+                        /* quoted-pair = "\" ( HTAB / SP / VCHAR / obs-text ) */
+                        if (++p >= end) return p;
+                        c = *p;
+                        if (!(c == '\t' || (c >= 0x20 && c != 0x7f))) return p;
+                        continue;
+                    }
+                    if (!pico_qdtext_chars[c]) {
+                        return p;
+                    }
+                }
+            } else {
+                const unsigned char *value = p;
+                while (p < end && pico_is_token_char(*p)) p++;
+                if (p == value) return p;
+            }
+        } else {
+            /* whitespace after the name belongs to the next ";" */
+            p = after_name;
+        }
+    }
+    return NULL;
+#undef PICO_SKIP_BWS
 }
 
 /*

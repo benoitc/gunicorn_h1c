@@ -589,6 +589,10 @@ PyInit__parser_fast(void)
     InvalidHeader = PyObject_GetAttrString(parser_module, "InvalidHeader");
     if (!InvalidHeader) { Py_DECREF(parser_module); return NULL; }
 
+    PicoUnsupportedTransferCoding = PyObject_GetAttrString(
+        parser_module, "UnsupportedTransferCoding");
+    if (!PicoUnsupportedTransferCoding) { Py_DECREF(parser_module); return NULL; }
+
     Py_DECREF(parser_module);
 
     return m;
